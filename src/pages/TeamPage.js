@@ -1,132 +1,150 @@
 import React, { useState, useEffect } from 'react';
-import { db, auth } from '../firebase/config';
-import { collection, query, where, getDocs, limit } from 'firebase/firestore';
-import { useAuth } from '../context/AuthContext';
-import { Link as RouterLink } from 'react-router-dom';
-import { signOut } from 'firebase/auth';
-import PendingActions from '../components/PendingActions';
-
-import { 
-  Box, Typography, Button, Card, CardContent, Grid, CircularProgress,
-  ToggleButtonGroup, ToggleButton, TableContainer, Table, TableHead, TableRow, TableCell, TableBody, Paper
+import {
+  Container,
+  Typography,
+  Box,
+  Paper,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  Avatar,
+  Chip,
+  Alert,
+  CircularProgress // Für eine schöne Ladeanzeige
 } from '@mui/material';
+import { doc, getDoc, collection, query, where, getDocs } from 'firebase/firestore'; // <-- WICHTIG: Alle nötigen Imports sind hier
+import { db } from '../firebase/config';
+import { useAuth } from '../context/AuthContext';
 
-function TeamPage() {
-  const { currentUser } = useAuth();
+// Helper-Funktion für Farb-Chips basierend auf der Position
+const getPositionChipColor = (positionGroup) => {
+  switch (positionGroup) {
+    case 'TOR': return 'warning';
+    case 'DEF': return 'info';
+    case 'MID': return 'success';
+    case 'ANG': return 'error';
+    default: return 'default';
+  }
+};
+
+// Hauptkomponente für die Team-Seite
+const TeamPage = () => {
+  const { user } = useAuth();
   const [team, setTeam] = useState(null);
   const [players, setPlayers] = useState([]);
-  const [scheduledGame, setScheduledGame] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [viewMode, setViewMode] = useState('cards');
+  const [error, setError] = useState('');
 
   useEffect(() => {
-    if (!currentUser) { setLoading(false); return; }
-
-    const fetchTeamAndPlayers = async () => {
-      setLoading(true);
+    const fetchTeamData = async () => {
+      // Stelle sicher, dass der user und seine teamId geladen sind
+      if (!user?.teamId) {
+        // Dieser Fall wird durch das Routing in App.js eigentlich verhindert,
+        // ist aber eine gute zusätzliche Sicherung.
+        setError("Benutzer- und Teamdaten werden noch geladen...");
+        setLoading(false);
+        return;
+      }
+      
       try {
-        const teamsRef = collection(db, 'teams');
-        const teamQuery = query(teamsRef, where('managerUid', '==', currentUser.uid), limit(1));
-        const teamSnapshot = await getDocs(teamQuery);
-        if (teamSnapshot.empty) { setLoading(false); return; }
+        const teamRef = doc(db, "teams", user.teamId);
+        const teamSnap = await getDoc(teamRef);
 
-        const foundTeam = { id: teamSnapshot.docs[0].id, ...teamSnapshot.docs[0].data() };
-        setTeam(foundTeam);
+        if (teamSnap.exists()) {
+          const teamData = teamSnap.data();
+          setTeam(teamData);
 
-        const playersRef = collection(db, 'players');
-        const playersQuery = query(playersRef, where('teamId', '==', foundTeam.id));
-        const playersSnapshot = await getDocs(playersQuery);
-        setPlayers(playersSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
-        
-        const gamesRef = collection(db, 'games');
-        const gameQuery = query(
-          gamesRef, 
-          where("teamIds", "array-contains", foundTeam.id),
-          where('status', '==', 'scheduled'), 
-          limit(1)
-        );
-        const gameSnapshot = await getDocs(gameQuery);
-        if (!gameSnapshot.empty) {
-          setScheduledGame({ id: gameSnapshot.docs[0].id, ...gameSnapshot.docs[0].data() });
+          // --- KORREKTUR: Spielerdaten sicher laden ---
+          // Prüfe, ob das 'players'-Array im Team-Dokument existiert und nicht leer ist
+          if (teamData.players && teamData.players.length > 0) {
+            // Baue eine Abfrage, um alle Spieler zu holen, deren ID im Array ist
+            const playerQuery = query(collection(db, 'players'), where('__name__', 'in', teamData.players));
+            const playerDocs = await getDocs(playerQuery);
+            const playersData = playerDocs.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            setPlayers(playersData);
+          } else {
+            // Fallback, falls das Team (noch) keine Spieler hat
+            setPlayers([]);
+          }
+        } else {
+          setError('Dein zugewiesenes Team wurde in der Datenbank nicht gefunden.');
         }
-      } catch (error) { console.error("Fehler beim Laden von Team & Spielern: ", error); } 
-      finally { setLoading(false); }
+      } catch (err) {
+        console.error("Originaler Fehler beim Laden der Teamdaten:", err);
+        setError('Ein technischer Fehler ist beim Laden der Teamdaten aufgetreten.');
+      } finally {
+        setLoading(false);
+      }
     };
-    fetchTeamAndPlayers();
-  }, [currentUser]);
 
-  const handleLogout = () => signOut(auth);
-  const handleViewChange = (event, newViewMode) => { if (newViewMode !== null) setViewMode(newViewMode); };
+    fetchTeamData();
+  }, [user]); // Effekt wird ausgeführt, wenn sich das user-Objekt ändert
 
-  if (loading) { return <CircularProgress />; }
-
-  if (!team) {
-    return (
-      <Box sx={{ p: 3, textAlign: 'center' }}>
-        <Typography variant="h5">Willkommen!</Typography>
-        <Typography sx={{ my: 2 }}>Für deinen Account wurde noch kein Team zugewiesen.</Typography>
-        <Button variant="outlined" onClick={handleLogout}>Logout</Button>
-      </Box>
-    );
-  }
+  if (loading) return <Box sx={{ display: 'flex', justifyContent: 'center', mt: 10 }}><CircularProgress /></Box>;
+  if (error) return <Alert severity="error" sx={{ m: 2 }}>{error}</Alert>;
+  if (!team) return <Typography sx={{textAlign: 'center', mt: 4}}>Kein Team gefunden.</Typography>;
 
   return (
-    <Box sx={{ p: 3 }}>
-      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
-        <Typography variant="h4" component="h1">
-          Kader von {team.name}
-        </Typography>
-        <ToggleButtonGroup value={viewMode} exclusive onChange={handleViewChange}>
-          <ToggleButton value="cards" aria-label="Kartenansicht">Karten</ToggleButton>
-          <ToggleButton value="list" aria-label="Listenansicht">Liste</ToggleButton>
-        </ToggleButtonGroup>
+    <Container sx={{ mt: 4 }}>
+      <Box sx={{ display: 'flex', alignItems: 'center', mb: 4 }}>
+        <Avatar src={team.logoUrl} sx={{ width: 60, height: 60, mr: 2, bgcolor: 'background.paper' }} />
+        <Typography variant="h4" component="h1">{team.name} - Kaderübersicht</Typography>
       </Box>
 
-      <Box sx={{ my: 2 }}>
-        <Button variant="outlined" onClick={handleLogout}>Logout</Button>
-        {scheduledGame && (<Button component={RouterLink} to={`/game/${scheduledGame.id}`} variant="contained" sx={{ ml: 2 }}>Zum nächsten Spiel</Button>)}
-      </Box>
-
-      <PendingActions myTeam={team} />
-      
-      {viewMode === 'cards' ? (
-        <Grid container spacing={2}>
-          {players.map(player => (
-            <Grid item key={player.id} xs={12} sm={6} md={4}>
-              <Card>
-                <CardContent>
-                  <Typography variant="h5" component="div">{player.name}</Typography>
-                  <Typography sx={{ mb: 1.5 }} color="text.secondary">Position: {player.position}</Typography>
-                  <Typography variant="body2"><strong>Stärke: {player.strength}</strong></Typography>
-                </CardContent>
-              </Card>
-            </Grid>
-          ))}
-        </Grid>
-      ) : (
-        <TableContainer component={Paper}>
+      <Paper elevation={3} sx={{ overflow: 'hidden' }}>
+        <TableContainer>
           <Table>
-            <TableHead>
+            <TableHead sx={{ backgroundColor: 'primary.main' }}>
               <TableRow>
-                <TableCell>Name</TableCell>
-                <TableCell>Position</TableCell>
-                <TableCell align="right">Stärke</TableCell>
+                <TableCell sx={{ color: 'white', fontWeight: 'bold' }}>Spieler</TableCell>
+                <TableCell sx={{ color: 'white', fontWeight: 'bold' }}>Position</TableCell>
+                <TableCell align="center" sx={{ color: 'white', fontWeight: 'bold' }}>Alter</TableCell>
+                <TableCell align="center" sx={{ color: 'white', fontWeight: 'bold' }}>Skill</TableCell>
+                <TableCell align="center" sx={{ color: 'white', fontWeight: 'bold' }}>Nationalität</TableCell>
               </TableRow>
             </TableHead>
             <TableBody>
-              {players.map((player) => (
-                <TableRow key={player.id} sx={{ '&:last-child td, &:last-child th': { border: 0 } }}>
-                  <TableCell component="th" scope="row">{player.name}</TableCell>
-                  <TableCell>{player.position}</TableCell>
-                  <TableCell align="right">{player.strength}</TableCell>
+              {players.length > 0 ? (
+                players.sort((a, b) => b.skill - a.skill).map((player) => (
+                  <TableRow key={player.id} hover sx={{ '&:last-child td, &:last-child th': { border: 0 } }}>
+                    <TableCell component="th" scope="row">
+                      <Box sx={{ display: 'flex', alignItems: 'center' }}>
+                        <Avatar sx={{ width: 40, height: 40, mr: 2, bgcolor: 'secondary.light' }}>
+                          {player.name.charAt(0)}
+                        </Avatar>
+                        {player.name}
+                      </Box>
+                    </TableCell>
+                    <TableCell>
+                      <Chip label={player.positionGroup} color={getPositionChipColor(player.positionGroup)} size="small" />
+                    </TableCell>
+                    <TableCell align="center">{player.age}</TableCell>
+                    <TableCell align="center" sx={{ fontWeight: 'bold' }}>{player.skill}</TableCell>
+                    <TableCell align="center">
+                      <Avatar 
+                        src={`https://flagcdn.com/w40/${player.nationality}.png`} 
+                        sx={{ width: 28, height: 20, margin: 'auto' }}
+                        variant="square"
+                      />
+                    </TableCell>
+                  </TableRow>
+                ))
+              ) : (
+                <TableRow>
+                    <TableCell colSpan={5} align="center">
+                        Dein Kader ist leer. Besuche den Transfermarkt!
+                    </TableCell>
                 </TableRow>
-              ))}
+              )}
             </TableBody>
           </Table>
         </TableContainer>
-      )}
-    </Box>
+      </Paper>
+    </Container>
   );
-}
+};
 
 export default TeamPage;
