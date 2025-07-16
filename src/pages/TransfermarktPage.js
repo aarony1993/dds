@@ -1,250 +1,127 @@
-import React, { useState, useEffect } from 'react';
-import { db } from '../firebase/config';
-import { collection, getDocs, query, where } from 'firebase/firestore';
-import { useAuth } from '../context/AuthContext';
+import React, { useEffect, useState } from "react";
 import {
   Box,
+  Paper,
   Typography,
-  Autocomplete,
-  TextField,
+  Avatar,
+  Grid,
   Button,
   Dialog,
   DialogTitle,
   DialogContent,
   DialogActions,
-  Checkbox,
-  List,
-  ListItem,
-  ListItemText,
-  Grid,
-  InputAdornment,
-} from '@mui/material';
+  TextField,
+} from "@mui/material";
+import { collection, getDocs, query, where } from "firebase/firestore";
+import { db } from "../firebase/config";
+import { useAuth } from "../context/AuthContext";
 
-function TransfermarktPage() {
-  const { currentUser } = useAuth();
-  const [teams, setTeams] = useState([]);
-  const [myTeamId, setMyTeamId] = useState(null);
-  const [selectedTeam, setSelectedTeam] = useState(null);
-  const [openDialog, setOpenDialog] = useState(false);
-  const [ownPlayers, setOwnPlayers] = useState([]);
-  const [otherPlayers, setOtherPlayers] = useState([]);
-  const [selectedOwnPlayers, setSelectedOwnPlayers] = useState([]);
-  const [selectedOtherPlayers, setSelectedOtherPlayers] = useState([]);
-  const [ownMoney, setOwnMoney] = useState('');
-  const [otherMoney, setOtherMoney] = useState('');
-  const [loadingPlayers, setLoadingPlayers] = useState(false);
+const TransfermarktPage = () => {
+  const { user } = useAuth();
+  const [players, setPlayers] = useState([]);
+  const [selectedPlayer, setSelectedPlayer] = useState(null);
+  const [offerDialogOpen, setOfferDialogOpen] = useState(false);
+  const [offerAmount, setOfferAmount] = useState("");
 
-  // Eigene Team-ID laden
   useEffect(() => {
-    if (!currentUser) return;
-    getDocs(query(collection(db, "teams"), where("managerUid", "==", currentUser.uid)))
-      .then(snap => {
-        if (!snap.empty) setMyTeamId(snap.docs[0].id);
-      });
-  }, [currentUser]);
+    // Fetch all players NOT in current user's team
+    const fetchPlayers = async () => {
+      if (!user) return;
 
-  // Lade alle Teams
-  useEffect(() => {
-    getDocs(collection(db, 'teams')).then(snap => {
-      setTeams(snap.docs.map(doc => ({ id: doc.id, ...doc.data() })));
-    });
-  }, []);
+      // Get user's team
+      const teamQuery = query(
+        collection(db, "teams"),
+        where("managerUid", "==", user.uid)
+      );
+      const teamSnapshot = await getDocs(teamQuery);
+      if (teamSnapshot.empty) return;
+      const userTeamId = teamSnapshot.docs[0].id;
 
-  // Lade Spielerlisten (eigene & gegnerische), wenn ein Team ausgewählt wurde
-  useEffect(() => {
-    if (!selectedTeam || !myTeamId) return;
-    setLoadingPlayers(true);
-    Promise.all([
-      getDocs(query(collection(db, "players"), where("teamId", "==", selectedTeam.id))),
-      getDocs(query(collection(db, "players"), where("teamId", "==", myTeamId)))
-    ]).then(([otherSnap, ownSnap]) => {
-      setOtherPlayers(otherSnap.docs.map(d => ({ id: d.id, ...d.data() })));
-      setOwnPlayers(ownSnap.docs.map(d => ({ id: d.id, ...d.data() })));
-      setSelectedOwnPlayers([]);
-      setSelectedOtherPlayers([]);
-      setOwnMoney('');
-      setOtherMoney('');
-      setLoadingPlayers(false);
-    });
-  }, [selectedTeam, myTeamId]);
+      // Get players not in user's team
+      const allPlayersSnapshot = await getDocs(collection(db, "players"));
 
-  const handleSendOffer = () => {
-    // Hier würdest du das Angebot in Firestore schreiben!
-    // z.B.: await addDoc(collection(db, "transfers"), { ... });
-    setOpenDialog(false);
-    alert("Angebot gesendet (hier in Firestore eintragen)");
+      setPlayers(
+        allPlayersSnapshot.docs
+          .map((doc) => ({ id: doc.id, ...doc.data() }))
+          .filter((player) => player.teamId !== userTeamId)
+      );
+    };
+
+    fetchPlayers();
+  }, [user]);
+
+  const handleOfferClick = (player) => {
+    setSelectedPlayer(player);
+    setOfferAmount("");
+    setOfferDialogOpen(true);
+  };
+
+  const handleOfferSubmit = () => {
+    // TODO: Implementiere Angebotserstellung per Firestore/Cloud Function
+    alert(
+      `Angebot für ${selectedPlayer.name} über ${offerAmount} € wurde (simuliert) abgeschickt.`
+    );
+    setOfferDialogOpen(false);
   };
 
   return (
-    <Box sx={{ maxWidth: 680, mx: "auto", mt: 5 }}>
-      <Typography variant="h4" sx={{ mb: 3, fontWeight: 800, color: "primary.main" }}>
+    <Box sx={{ p: 3 }}>
+      <Typography variant="h4" gutterBottom>
         Transfermarkt
       </Typography>
+      <Grid container spacing={2}>
+        {players.map((player) => (
+          <Grid key={player.id} lg={3} xl={2}>
+            <Paper sx={{ p: 2, display: "flex", alignItems: "center" }}>
+              <Avatar
+                src={player.avatarUrl || "/dummy-player.png"}
+                sx={{ width: 48, height: 48, mr: 2 }}
+                alt={player.name}
+              />
+              <Box>
+                <Typography variant="subtitle1">{player.name}</Typography>
+                <Typography variant="body2">
+                  Position: {player.position || "-"}
+                </Typography>
+                <Typography variant="body2">
+                  PositionGroup: {player.positionGroup || "-"}
+                </Typography>
+                <Button
+                  sx={{ mt: 1 }}
+                  variant="outlined"
+                  onClick={() => handleOfferClick(player)}
+                >
+                  Angebot abgeben
+                </Button>
+              </Box>
+            </Paper>
+          </Grid>
+        ))}
+      </Grid>
 
-      <Autocomplete
-        options={teams}
-        getOptionLabel={option => option.name || "Unbekannter Verein"}
-        sx={{ mb: 2 }}
-        onChange={(_, value) => setSelectedTeam(value)}
-        renderInput={params => (
-          <TextField {...params} label="Verein suchen..." variant="outlined" />
-        )}
-        isOptionEqualToValue={(option, value) => option.id === value.id}
-      />
-
-      <Button
-        variant="contained"
-        color="primary"
-        disabled={!selectedTeam}
-        onClick={() => setOpenDialog(true)}
-        sx={{ mt: 2, fontWeight: 700 }}
-      >
-        Angebot an {selectedTeam ? selectedTeam.name : "..." } machen
-      </Button>
-
-      {/* MODALES ANGEBOTS-FENSTER */}
-      <Dialog
-        open={openDialog}
-        onClose={() => setOpenDialog(false)}
-        fullWidth
-        maxWidth="md"
-        PaperProps={{
-          sx: {
-            bgcolor: "background.paper",
-            color: "text.primary",
-            borderRadius: 3,
-            boxShadow: "0 4px 32px #000a",
-          }
-        }}
-      >
-        <DialogTitle sx={{ fontWeight: 700 }}>
-          Transferangebot an {selectedTeam?.name}
+      <Dialog open={offerDialogOpen} onClose={() => setOfferDialogOpen(false)}>
+        <DialogTitle>
+          Transferangebot für {selectedPlayer?.name}
         </DialogTitle>
         <DialogContent>
-          {loadingPlayers ? (
-            <Typography>Lade Spieler...</Typography>
-          ) : (
-            <Grid container spacing={2}>
-              <Grid item xs={12} md={6}>
-                <Typography variant="subtitle1" sx={{ mb: 1, color: "primary.main" }}>Deine Spieler</Typography>
-                <List dense sx={{
-                  maxHeight: 220,
-                  overflow: "auto",
-                  bgcolor: "#162138",
-                  borderRadius: 2,
-                  color: "text.primary"
-                }}>
-                  {ownPlayers.map(player => (
-                    <ListItem key={player.id} dense button
-                      onClick={() =>
-                        setSelectedOwnPlayers(arr =>
-                          arr.includes(player.id)
-                            ? arr.filter(id => id !== player.id)
-                            : [...arr, player.id]
-                        )
-                      }>
-                      <Checkbox checked={selectedOwnPlayers.includes(player.id)} sx={{ color: "primary.main" }} />
-                      <ListItemText primary={player.name} secondary={player.positionKey || player.position} />
-                    </ListItem>
-                  ))}
-                  {ownPlayers.length === 0 && (
-                    <ListItem>
-                      <ListItemText primary="(Keine Spieler gefunden)" />
-                    </ListItem>
-                  )}
-                </List>
-                <TextField
-                  label="Dein Geldbetrag"
-                  value={ownMoney}
-                  onChange={e => setOwnMoney(e.target.value.replace(/[^0-9]/g, ''))}
-                  type="number"
-                  fullWidth
-                  sx={{
-                    mt: 2,
-                    input: { color: "text.primary", fontWeight: 700 },
-                    label: { color: "primary.main" },
-                    bgcolor: "#162138",
-                    borderRadius: 2
-                  }}
-                  InputProps={{
-                    endAdornment: <InputAdornment position="end">€</InputAdornment>,
-                    sx: { color: "text.primary" }
-                  }}
-                  InputLabelProps={{
-                    style: { color: "#ffbc29" }
-                  }}
-                />
-              </Grid>
-              <Grid item xs={12} md={6}>
-                <Typography variant="subtitle1" sx={{ mb: 1, color: "primary.main" }}>{selectedTeam?.name} – Spieler</Typography>
-                <List dense sx={{
-                  maxHeight: 220,
-                  overflow: "auto",
-                  bgcolor: "#162138",
-                  borderRadius: 2,
-                  color: "text.primary"
-                }}>
-                  {otherPlayers.map(player => (
-                    <ListItem key={player.id} dense button
-                      onClick={() =>
-                        setSelectedOtherPlayers(arr =>
-                          arr.includes(player.id)
-                            ? arr.filter(id => id !== player.id)
-                            : [...arr, player.id]
-                        )
-                      }>
-                      <Checkbox checked={selectedOtherPlayers.includes(player.id)} sx={{ color: "primary.main" }} />
-                      <ListItemText primary={player.name} secondary={player.positionKey || player.position} />
-                    </ListItem>
-                  ))}
-                  {otherPlayers.length === 0 && (
-                    <ListItem>
-                      <ListItemText primary="(Keine Spieler gefunden)" />
-                    </ListItem>
-                  )}
-                </List>
-                <TextField
-                  label="Geldbetrag gegnerischer Verein"
-                  value={otherMoney}
-                  onChange={e => setOtherMoney(e.target.value.replace(/[^0-9]/g, ''))}
-                  type="number"
-                  fullWidth
-                  sx={{
-                    mt: 2,
-                    input: { color: "text.primary", fontWeight: 700 },
-                    label: { color: "primary.main" },
-                    bgcolor: "#162138",
-                    borderRadius: 2
-                  }}
-                  InputProps={{
-                    endAdornment: <InputAdornment position="end">€</InputAdornment>,
-                    sx: { color: "text.primary" }
-                  }}
-                  InputLabelProps={{
-                    style: { color: "#ffbc29" }
-                  }}
-                />
-              </Grid>
-            </Grid>
-          )}
+          <TextField
+            label="Angebot (€)"
+            type="number"
+            value={offerAmount}
+            onChange={(e) => setOfferAmount(e.target.value)}
+            fullWidth
+            autoFocus
+          />
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setOpenDialog(false)} color="primary" variant="outlined" sx={{ fontWeight: 700 }}>
-            Abbrechen
-          </Button>
-          <Button
-            onClick={handleSendOffer}
-            variant="contained"
-            color="primary"
-            sx={{ fontWeight: 700 }}
-            disabled={loadingPlayers || (!selectedOwnPlayers.length && !ownMoney && !selectedOtherPlayers.length && !otherMoney)}
-          >
-            Angebot absenden
+          <Button onClick={() => setOfferDialogOpen(false)}>Abbrechen</Button>
+          <Button onClick={handleOfferSubmit} variant="contained" disabled={!offerAmount}>
+            Abschicken
           </Button>
         </DialogActions>
       </Dialog>
     </Box>
   );
-}
+};
 
 export default TransfermarktPage;
