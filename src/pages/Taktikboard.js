@@ -1,183 +1,252 @@
-import React, { useEffect, useState } from "react";
+
+import React, { useState, useEffect } from "react";
 import {
   Box,
-  Typography,
   Paper,
-  Button,
-  Select,
+  Typography,
   MenuItem,
-  FormControl,
-  InputLabel,
+  Select,
   Slider,
+  Button,
   Dialog,
   DialogTitle,
   DialogContent,
   DialogActions,
   List,
   ListItem,
-  ListItemText,
+  ListItemAvatar,
   Avatar,
+  ListItemText,
+  Tooltip
 } from "@mui/material";
-import { collection, getDocs, query, where, updateDoc, doc } from "firebase/firestore";
-import { db } from "../firebase/config";
 import { useAuth } from "../context/AuthContext";
+import { db } from "../firebase/config";
+import { collection, query, where, getDocs, doc, updateDoc } from "firebase/firestore";
 
-// Layout für Spielerplätze auf dem Feld pro Formation (rel. Werte: 0-100)
-const FORMATIONS = [
-  {
-    name: "4-4-2 (Flach)",
-    positions: [
-      { label: "TW", key: "TW", positionGroup: "TOR", x: 50, y: 92 },
-      { label: "LV", key: "LV", positionGroup: "DEF", x: 20, y: 75 },
-      { label: "IV1", key: "IV1", positionGroup: "DEF", x: 38, y: 80 },
-      { label: "IV2", key: "IV2", positionGroup: "DEF", x: 62, y: 80 },
-      { label: "RV", key: "RV", positionGroup: "DEF", x: 80, y: 75 },
-      { label: "LM", key: "LM", positionGroup: "MID", x: 15, y: 60 },
-      { label: "ZM1", key: "ZM1", positionGroup: "MID", x: 40, y: 62 },
-      { label: "ZM2", key: "ZM2", positionGroup: "MID", x: 60, y: 62 },
-      { label: "RM", key: "RM", positionGroup: "MID", x: 85, y: 60 },
-      { label: "ST1", key: "ST1", positionGroup: "ATT", x: 35, y: 40 },
-      { label: "ST2", key: "ST2", positionGroup: "ATT", x: 65, y: 40 },
-    ],
-  },
-  // Weitere Formationen können analog ergänzt werden.
+// --- Mapping Feldposition => Positionsgruppe
+// --- Mapping Feldposition => Positionsgruppe nach deinem Seed
+const positionGroupMapping = {
+  "TW": "TOR",
+  "IV": "DEF",
+  "LV": "DEF",
+  "RV": "DEF",
+  "ZDM": "MID",
+  "ZM": "MID",
+  "LM": "MID",
+  "RM": "MID",
+  "ZOM": "MID",
+  "HS": "ATT",
+  "ST": "ATT",
+  "MS": "ATT",
+  "LA": "ATT",
+  "RA": "ATT"
+};
+
+
+// --- Flaggen Mapping
+const flagEmoji = (country) => {
+  const flags = {
+    "Deutschland": "🇩🇪",
+    "Italien": "🇮🇹",
+    "Frankreich": "🇫🇷",
+    "England": "🇬🇧",
+    "Spanien": "🇪🇸",
+    "Portugal": "🇵🇹",
+  };
+  return flags[country] || "🏳️";
+};
+
+// --- Formationen: Feldpositionen mit exakten Koordinaten (% des Spielfelds) ---
+const formations = {
+  "4-4-2 Flach": [
+    { pos: "TW", x: 50, y: 96 },
+    { pos: "LV", x: 16, y: 78 },
+    { pos: "IV1", x: 34, y: 83 },
+    { pos: "IV2", x: 66, y: 83 },
+    { pos: "RV", x: 84, y: 78 },
+    { pos: "LM", x: 16, y: 59 },
+    { pos: "ZM1", x: 37, y: 62 },
+    { pos: "ZM2", x: 63, y: 62 },
+    { pos: "RM", x: 84, y: 59 },
+    { pos: "ST1", x: 40, y: 35 },
+    { pos: "ST2", x: 60, y: 35 }
+  ],
+  "4-4-2 Raute": [
+    { pos: "TW", x: 50, y: 96 },
+    { pos: "LV", x: 16, y: 78 },
+    { pos: "IV1", x: 34, y: 83 },
+    { pos: "IV2", x: 66, y: 83 },
+    { pos: "RV", x: 84, y: 78 },
+    { pos: "ZDM", x: 50, y: 73 },
+    { pos: "LM", x: 28, y: 60 },
+    { pos: "RM", x: 72, y: 60 },
+    { pos: "ZOM", x: 50, y: 51 },
+    { pos: "ST1", x: 40, y: 35 },
+    { pos: "ST2", x: 60, y: 35 }
+  ],
+  "4-3-3": [
+    { pos: "TW", x: 50, y: 96 },
+    { pos: "LV", x: 16, y: 78 },
+    { pos: "IV1", x: 34, y: 83 },
+    { pos: "IV2", x: 66, y: 83 },
+    { pos: "RV", x: 84, y: 78 },
+    { pos: "ZM1", x: 32, y: 66 },
+    { pos: "ZM2", x: 68, y: 66 },
+    { pos: "ZM3", x: 50, y: 54 },
+    { pos: "LA", x: 15, y: 35 },
+    { pos: "ST", x: 50, y: 30 },
+    { pos: "RA", x: 85, y: 35 }
+  ],
+  "5-4-1": [
+    { pos: "TW", x: 50, y: 96 },
+    { pos: "LV", x: 10, y: 80 },
+    { pos: "IV1", x: 26, y: 85 },
+    { pos: "IV2", x: 50, y: 86 },
+    { pos: "IV3", x: 74, y: 85 },
+    { pos: "RV", x: 90, y: 80 },
+    { pos: "LM", x: 16, y: 59 },
+    { pos: "ZM1", x: 37, y: 62 },
+    { pos: "ZM2", x: 63, y: 62 },
+    { pos: "RM", x: 84, y: 59 },
+    { pos: "ST", x: 50, y: 35 }
+  ]
+};
+
+// --- Slider Labels ---
+const tacticSliderMarks = [
+  { value: 0, label: "Defensiv" },
+  { value: 1, label: "Ausbalanciert" },
+  { value: 2, label: "Offensiv" }
 ];
 
-const Taktikboard = () => {
+export default function Taktikboard() {
   const { user } = useAuth();
-  const [team, setTeam] = useState(null);
+  const [formationKey, setFormationKey] = useState("4-4-2 Flach");
+  const [formation, setFormation] = useState(formations["4-4-2 Flach"]);
+  const [tacticLevel, setTacticLevel] = useState(1);
   const [players, setPlayers] = useState([]);
-  const [formation, setFormation] = useState(FORMATIONS[0]);
-  const [lineup, setLineup] = useState({});
-  const [tactics, setTactics] = useState({ defenseLine: 50, pressing: 50 });
-  const [dialogOpen, setDialogOpen] = useState(false);
-  const [selectedPosition, setSelectedPosition] = useState(null);
+  const [teamData, setTeamData] = useState(null);
+  const [fieldPlayers, setFieldPlayers] = useState({});
+  const [selectingPos, setSelectingPos] = useState(null);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const fetchTeamAndPlayers = async () => {
-      if (!user) return;
-
-      // Team laden
-      const teamQuery = query(
-        collection(db, "teams"),
-        where("managerUid", "==", user.uid)
-      );
-      const teamSnapshot = await getDocs(teamQuery);
-      if (teamSnapshot.empty) return;
-      const teamDoc = teamSnapshot.docs[0];
-      setTeam({ id: teamDoc.id, ...teamDoc.data() });
-
-      // Spieler laden
-      const playersQuery = query(
-        collection(db, "players"),
-        where("teamId", "==", teamDoc.id)
-      );
-      const playersSnapshot = await getDocs(playersQuery);
-      setPlayers(playersSnapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() })));
-
-      // Formation/Taktik/Lineup laden
-      const data = teamDoc.data();
-      if (data.formationName) {
-        const f = FORMATIONS.find((f) => f.name === data.formationName);
-        if (f) setFormation(f);
-      }
-      if (data.lineup) setLineup(data.lineup);
-      if (data.tactics) setTactics(data.tactics);
+    console.log("Aktueller User:", user);
+  }, [user]);
+  
+  // --- Fetch team & players ---
+  useEffect(() => {
+    const fetchData = async () => {
+      if (!user?.teamId) return;
+      setLoading(true);
+      // Fetch Team
+      const teamDoc = await getDocs(query(collection(db, "teams"), where("id", "==", user.teamId)));
+      const team = teamDoc.docs.length > 0 ? { id: teamDoc.docs[0].id, ...teamDoc.docs[0].data() } : null;
+      setTeamData(team);
+      // Fetch Players
+      const playerSnap = await getDocs(query(collection(db, "players"), where("teamId", "==", user.teamId)));
+      setPlayers(playerSnap.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+      setLoading(false);
     };
-
-    fetchTeamAndPlayers();
-    // eslint-disable-next-line
+    fetchData();
   }, [user]);
 
-  const handleSave = async () => {
-    if (!team) return;
-    await updateDoc(doc(db, "teams", team.id), {
-      formationName: formation.name,
-      lineup,
-      tactics,
-    });
-  };
+  // --- Formation wechseln
+  useEffect(() => {
+    setFormation(formations[formationKey]);
+    // Reset Auswahl auf neue Formation
+    setFieldPlayers({});
+  }, [formationKey]);
 
-  // Spieler-Auswahldialog
-  const handleOpenDialog = (position) => {
-    setSelectedPosition(position);
-    setDialogOpen(true);
-  };
-
-  const handleSelectPlayer = (playerId) => {
-    setLineup((prev) => ({
+  // --- Handle Player Selection ---
+  const handleSelectPlayer = (posKey, playerId) => {
+    setFieldPlayers(prev => ({
       ...prev,
-      [selectedPosition.key]: playerId,
+      [posKey]: playerId
     }));
-    setDialogOpen(false);
+    setSelectingPos(null);
   };
 
-  // Welche Spieler passen auf die Position? (Optional nach positionGroup filtern)
-  const availablePlayers = players.filter(
-    (p) =>
-      !Object.values(lineup).includes(p.id) || lineup[selectedPosition?.key] === p.id
-  );
+  // --- Spieler für das aktuelle Feld filtern (Positionsgruppe)
+  const getEligiblePlayers = (posKey) => {
+    const group = positionGroupMapping[posKey.replace(/[0-9]/g, "")] || "";
+    // bereits gesetzte Spieler ausblenden:
+    const usedPlayerIds = Object.values(fieldPlayers).filter(id => !!id);
+    return players.filter(
+      p => p.positionGroup === group && !usedPlayerIds.includes(p.id)
+    );
+  };
+
+  // --- Spieler-Objekt für Feldposition holen
+  const getPlayerForPos = (posKey) => {
+    const pid = fieldPlayers[posKey];
+    return players.find(p => p.id === pid);
+  };
+
+  // --- Speichern in Firestore
+  const handleSave = async () => {
+    if (!user?.teamId) return;
+    const formationData = formation.map(f => ({
+      positionKey: f.pos,
+      playerId: fieldPlayers[f.pos] || null
+    }));
+    try {
+      await updateDoc(doc(db, "teams", user.teamId), {
+        formation: formationData,
+        tacticLevel
+      });
+      alert("Taktik und Aufstellung gespeichert!");
+    } catch (e) {
+      alert("Fehler beim Speichern.");
+    }
+  };
+
+  if (loading) return <Typography>Lade...</Typography>;
 
   return (
-    <Box sx={{ display: "flex", height: "calc(100vh - 64px)", px: 5, pt: 5 }}>
-      {/* Sidebar */}
-      <Paper sx={{ width: 340, p: 4, mr: 4, bgcolor: "#232a34", color: "white" }}>
-        <Typography variant="h5" sx={{ mb: 3 }}>
-          Formation
-        </Typography>
-        <FormControl fullWidth sx={{ mb: 3 }}>
-          <InputLabel sx={{ color: "white" }}>Formation</InputLabel>
-          <Select
-            value={formation.name}
-            label="Formation"
-            onChange={(e) => {
-              const f = FORMATIONS.find((f) => f.name === e.target.value);
-              setFormation(f);
-              setLineup({});
-            }}
-            sx={{ color: "white" }}
-          >
-            {FORMATIONS.map((f) => (
-              <MenuItem key={f.name} value={f.name}>
-                {f.name}
-              </MenuItem>
-            ))}
-          </Select>
-        </FormControl>
-        <Box sx={{ mb: 2 }}>
-          <Typography variant="body1">Abwehrhöhe: {tactics.defenseLine}</Typography>
-          <Slider
-            value={tactics.defenseLine}
-            min={0}
-            max={100}
-            onChange={(_, val) =>
-              setTactics((prev) => ({ ...prev, defenseLine: val }))
-            }
-            sx={{ color: "#ffc107" }}
-          />
-        </Box>
-        <Box sx={{ mb: 3 }}>
-          <Typography variant="body1">Pressing: {tactics.pressing}</Typography>
-          <Slider
-            value={tactics.pressing}
-            min={0}
-            max={100}
-            onChange={(_, val) =>
-              setTactics((prev) => ({ ...prev, pressing: val }))
-            }
-            sx={{ color: "#ffc107" }}
-          />
-        </Box>
-        <Button
-          variant="contained"
+    <Box sx={{
+      display: 'flex',
+      justifyContent: 'center',
+      alignItems: 'flex-start',
+      minHeight: '80vh',
+      gap: 4,
+      mt: 5
+    }}>
+      {/* Taktik Panel */}
+      <Paper elevation={6} sx={{
+        p: 4,
+        minWidth: 350,
+        bgcolor: "#212933",
+        color: "#fff",
+        borderRadius: 4
+      }}>
+        <Typography variant="h4" sx={{ mb: 3, color: "#fff", fontWeight: 700 }}>Formation</Typography>
+        <Typography variant="body2" sx={{ color: "#ffc447", mb: 1 }}>Formation</Typography>
+        <Select
           fullWidth
-          sx={{
-            bgcolor: "#ffc107",
-            color: "#1a1a1a",
-            fontWeight: "bold",
-            mt: 1,
-            ":hover": { bgcolor: "#ffb300" },
-          }}
+          value={formationKey}
+          onChange={e => setFormationKey(e.target.value)}
+          sx={{ mb: 3, color: "#fff", bgcolor: "#1a232b" }}
+        >
+          {Object.keys(formations).map(fk => (
+            <MenuItem key={fk} value={fk}>{fk}</MenuItem>
+          ))}
+        </Select>
+        <Typography variant="body2" sx={{ color: "#ffc447", mb: 1 }}>Taktikrichtung</Typography>
+        <Slider
+          value={tacticLevel}
+          min={0}
+          max={2}
+          marks={tacticSliderMarks}
+          step={1}
+          sx={{ mb: 4, color: "#ffc447" }}
+          onChange={(_, val) => setTacticLevel(val)}
+        />
+        <Button
+          fullWidth
+          variant="contained"
+          color="warning"
+          sx={{ fontWeight: 700, py: 1.5, fontSize: 18, mt: 2, letterSpacing: 1 }}
           onClick={handleSave}
         >
           SPEICHERN
@@ -185,145 +254,129 @@ const Taktikboard = () => {
       </Paper>
 
       {/* Spielfeld */}
-      <Box
-        sx={{
-          flex: 1,
-          position: "relative",
-          bgcolor: "#1a6834",
+      <Box sx={{
+        position: "relative",
+        width: 600,
+        height: 800,
+        bgcolor: "transparent",
+        borderRadius: 6,
+        overflow: "hidden",
+        background: "#116820",
+        boxShadow: "0 0 32px #111d"
+      }}>
+        {/* Linien */}
+        <Box sx={{
+          position: "absolute",
+          left: "5%",
+          top: "4%",
+          width: "90%",
+          height: "92%",
+          border: "4px solid #a4ffa4",
           borderRadius: "32px",
-          boxShadow: 6,
-          minHeight: 720,
-          overflow: "hidden",
-        }}
-      >
-        {/* Feld-Linien (einfaches SVG) */}
-        <svg
-          width="100%"
-          height="100%"
-          viewBox="0 0 100 100"
-          preserveAspectRatio="none"
-          style={{ position: "absolute", left: 0, top: 0, zIndex: 0, opacity: 0.25 }}
-        >
-          <rect x="3" y="3" width="94" height="94" rx="10" fill="none" stroke="white" strokeWidth="1" />
-          <rect x="10" y="10" width="80" height="80" rx="2" fill="none" stroke="white" strokeWidth="0.5" />
-          <circle cx="50" cy="50" r="10" fill="none" stroke="white" strokeWidth="0.5" />
-        </svg>
-        {/* Spielerplätze */}
-        {formation.positions.map((pos) => {
-          const playerId = lineup[pos.key];
-          const player = players.find((p) => p.id === playerId);
-
+          zIndex: 0
+        }}/>
+        {/* Mittelkreis */}
+        <Box sx={{
+          position: "absolute",
+          top: "37%",
+          left: "35%",
+          width: "30%",
+          height: "11%",
+          border: "4px solid #a4ffa4",
+          borderRadius: "50%",
+          zIndex: 1
+        }}/>
+        {/* Spieler */}
+        {formation.map(f => {
+          const pObj = getPlayerForPos(f.pos);
           return (
-            <Box
-              key={pos.key}
-              sx={{
-                position: "absolute",
-                left: `${pos.x}%`,
-                top: `${pos.y}%`,
-                transform: "translate(-50%,-50%)",
-                width: 72,
-                height: 72,
-                zIndex: 1,
-                cursor: "pointer",
-              }}
-              onClick={() => handleOpenDialog(pos)}
-            >
-              <Paper
-                elevation={player ? 6 : 1}
+            <Tooltip key={f.pos} title={pObj ? `${pObj.vorname} ${pObj.nachname} (${pObj.position})` : `Position: ${f.pos}`}>
+              <Box
+                onClick={() => setSelectingPos(f.pos)}
                 sx={{
-                  width: "100%",
-                  height: "100%",
-                  bgcolor: player ? "#fffde7" : "#e0e0e0",
+                  position: "absolute",
+                  left: `calc(${f.x}% - 36px)`,
+                  top: `calc(${f.y}% - 36px)`,
+                  width: 72,
+                  height: 72,
+                  bgcolor: pObj ? "#32436e" : "#eee",
+                  color: pObj ? "#fff" : "#465674",
                   display: "flex",
                   flexDirection: "column",
                   alignItems: "center",
                   justifyContent: "center",
-                  borderRadius: 2,
-                  border: player ? "2px solid #ffc107" : "1px solid #bbb",
+                  borderRadius: 2.5,
+                  border: pObj ? "3px solid #ffc447" : "2px solid #b7c0cd",
+                  fontWeight: 700,
+                  fontSize: 18,
+                  cursor: "pointer",
+                  boxShadow: pObj ? "0 0 12px #ffc44788" : "none",
+                  transition: "all 0.13s",
+                  zIndex: 3,
+                  "&:hover": {
+                    bgcolor: "#4854ab",
+                    color: "#ffc447"
+                  }
                 }}
               >
-                <Typography variant="caption" color="textSecondary" sx={{ mb: 1 }}>
-                  {pos.label}
-                </Typography>
-                <Avatar
-                  src={player?.avatarUrl || undefined}
-                  sx={{ width: 36, height: 36, mb: 1, bgcolor: "#bdbdbd" }}
-                >
-                  {!player && <span role="img" aria-label="Spieler">👤</span>}
-                </Avatar>
-                <Typography
-                  variant="subtitle2"
-                  sx={{
-                    fontWeight: "bold",
-                    color: "#3d3d3d",
-                    fontSize: 14,
-                    maxWidth: "90%",
-                    textAlign: "center",
-                    lineHeight: 1.1,
-                  }}
-                >
-                  {player?.name || "-"}
-                </Typography>
-              </Paper>
-            </Box>
+                <span style={{
+                  fontSize: 15,
+                  fontWeight: 800,
+                  letterSpacing: 1,
+                  marginBottom: 2
+                }}>{f.pos}</span>
+                {pObj ? (
+                  <>
+                    <span style={{ fontSize: 17, fontWeight: 700, lineHeight: 1 }}>{pObj.vorname}</span>
+                    <span style={{ fontSize: 13, opacity: 0.7 }}>{pObj.nachname}</span>
+                    <span style={{ fontSize: 22 }}>{flagEmoji(pObj.nationalitaet)}</span>
+                  </>
+                ) : (
+                  <span style={{ fontSize: 36, opacity: 0.3, fontWeight: 900 }}>+</span>
+                )}
+              </Box>
+            </Tooltip>
           );
         })}
       </Box>
 
-      {/* Auswahldialog */}
-      <Dialog open={dialogOpen} onClose={() => setDialogOpen(false)} maxWidth="xs" fullWidth>
-        <DialogTitle>
-          Spieler auswählen {selectedPosition ? `(${selectedPosition.label})` : ""}
+      {/* Spieler-Auswahl-Modal */}
+      <Dialog open={!!selectingPos} onClose={() => setSelectingPos(null)} maxWidth="xs" fullWidth>
+        <DialogTitle sx={{ bgcolor: "#27344b", color: "#ffc447", fontWeight: 800 }}>
+          Spieler auswählen ({selectingPos})
         </DialogTitle>
-        <DialogContent dividers>
+        <DialogContent sx={{ bgcolor: "#202c3b", minHeight: 340 }}>
           <List>
-            {availablePlayers.map((player) => (
-              <ListItem
-                key={player.id}
-                button
-                onClick={() => handleSelectPlayer(player.id)}
-                selected={lineup[selectedPosition?.key] === player.id}
-                sx={{
-                  mb: 1,
-                  borderRadius: 2,
-                  bgcolor: "#2b3646",
-                  color: "white",
-                  "&.Mui-selected": { bgcolor: "#ffc107", color: "#232a34" },
-                }}
-              >
-                <Avatar
-                  src={player.avatarUrl || undefined}
-                  sx={{ mr: 2, bgcolor: "#bdbdbd" }}
-                >
-                  <span role="img" aria-label="Spieler">👤</span>
-                </Avatar>
+            {selectingPos && getEligiblePlayers(selectingPos.replace(/[0-9]/g, "")).length === 0 && (
+              <Typography sx={{ color: "#fff" }}>Keine passenden Spieler verfügbar.</Typography>
+            )}
+            {selectingPos && getEligiblePlayers(selectingPos.replace(/[0-9]/g, "")).map(p => (
+              <ListItem button key={p.id} onClick={() => handleSelectPlayer(selectingPos, p.id)}>
+                <ListItemAvatar>
+                  <Avatar src={p.avatarUrl} sx={{ bgcolor: "#3c4e5e" }}>{p.vorname?.[0] || "?"}</Avatar>
+                </ListItemAvatar>
                 <ListItemText
                   primary={
-                    <span>
-                      <b>{player.name}</b>
+                    <span style={{ fontWeight: 600, color: "#ffc447" }}>
+                      {p.vorname} {p.nachname}
+                      {" "}
+                      <span style={{ fontSize: 19 }}>{flagEmoji(p.nationalitaet)}</span>
                     </span>
                   }
                   secondary={
-                    <>
-                      Position: {player.position || "-"} | Stärke: {player.strength}
-                      <br />
-                      Rolle: {player.positionGroup || "-"}
-                    </>
+                    <span style={{ color: "#fff" }}>
+                      {p.position} | Stärke: {p.staerke}
+                    </span>
                   }
                 />
               </ListItem>
             ))}
-            {availablePlayers.length === 0 && (
-              <Typography variant="body2">Keine Spieler verfügbar.</Typography>
-            )}
           </List>
         </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setDialogOpen(false)}>Abbrechen</Button>
+        <DialogActions sx={{ bgcolor: "#27344b" }}>
+          <Button onClick={() => setSelectingPos(null)} color="warning" variant="text" sx={{ fontWeight: 700 }}>ABBRECHEN</Button>
         </DialogActions>
       </Dialog>
     </Box>
   );
-};
-
-export default Taktikboard;
+}

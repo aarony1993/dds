@@ -43,6 +43,7 @@ function Navbar() {
         <Button color="inherit" component={RouterLink} to="/">Mein Kader</Button>
         <Button color="inherit" component={RouterLink} to="/historie">Historie</Button>
         <Button color="inherit" component={RouterLink} to="/taktik">Taktik</Button>
+        <Button color="inherit" component={RouterLink} to="/pending">FS & Transfers annehmen</Button>
         <Button color="inherit" component={RouterLink} to="/transfermarkt">Transfermarkt</Button>
         <Button color="inherit" component={RouterLink} to="/challenge">Freundschaftsspiele</Button>
         <Button

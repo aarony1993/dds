@@ -24,6 +24,7 @@ import TransfermarktPage from './pages/TransfermarktPage';
 import ChallengePage from './pages/ChallengePage';
 import MatchHistoryPage from './pages/MatchHistoryPage';
 import MatchResultPage from './pages/MatchResultPage';
+import PendingActionsPage from './pages/PendingActionsPage';
 
 function App() {
   return (
@@ -66,6 +67,7 @@ function AppContent() {
               <Route path="/admin" element={<AdminPage />} />
               <Route path="/login" element={<Navigate to="/" replace />} />
               <Route path="*" element={<Navigate to="/" replace />} />
+              <Route path="/pending" element={<PendingActionsPage />} />
             </>
           ) : (
             <>
