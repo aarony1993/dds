@@ -1,43 +1,28 @@
 // simulationEngine.js
 
-// Multiplikatoren für jede Detailposition und Aktion
 const positionActionModifiers = {
-  //      Tackling  Pass  Dribbling  Schuss
-  "TW":  [1.1,     0.7,   0.3,      0.2],
-  "IV":  [1.3,     0.8,   0.5,      0.4],
-  "LV":  [1.2,     0.9,   0.7,      0.6],
-  "RV":  [1.2,     0.9,   0.7,      0.6],
-  "ZDM": [1.2,     1.1,   0.7,      0.6],
-  "ZM":  [1.0,     1.3,   1.1,      0.8],
-  "LM":  [0.9,     1.2,   1.2,      0.9],
-  "RM":  [0.9,     1.2,   1.2,      0.9],
-  "ZOM": [0.7,     1.3,   1.3,      1.1],
-  "HS":  [0.6,     1.0,   1.2,      1.3],
-  "ST":  [0.5,     0.8,   1.1,      1.4],
-  "MS":  [0.5,     0.7,   1.0,      1.5],
-  "LA":  [0.6,     0.9,   1.2,      1.3],
-  "RA":  [0.6,     0.9,   1.2,      1.3],
+  "TW":  [1.1, 0.7, 0.3, 0.2],
+  "IV":  [1.3, 0.8, 0.5, 0.4],
+  "LV":  [1.2, 0.9, 0.7, 0.6],
+  "RV":  [1.2, 0.9, 0.7, 0.6],
+  "ZDM": [1.2, 1.1, 0.7, 0.6],
+  "ZM":  [1.0, 1.3, 1.1, 0.8],
+  "LM":  [0.9, 1.2, 1.2, 0.9],
+  "RM":  [0.9, 1.2, 1.2, 0.9],
+  "ZOM": [0.7, 1.3, 1.3, 1.1],
+  "HS":  [0.6, 1.0, 1.2, 1.3],
+  "ST":  [0.5, 0.8, 1.1, 1.4],
+  "MS":  [0.5, 0.7, 1.0, 1.5],
+  "LA":  [0.6, 0.9, 1.2, 1.3],
+  "RA":  [0.6, 0.9, 1.2, 1.3],
 };
 
-// Aktionen je Zone
-const zoneActions = {
-  defense:   ["pass", "duel"],
-  midfield:  ["pass", "dribble", "killerPass", "duel"],
-  attack:    ["pass", "dribble", "shoot", "duel"],
+const groupToDefaultDetail = {
+  "DEF": "IV",
+  "MID": "ZM",
+  "ATT": "ST",
+  "TOR": "TW"
 };
-
-function getPlayersByZone(teamPlayers, zone) {
-  if (zone === "defense") {
-    return teamPlayers.filter(p => ["IV", "LV", "RV", "TW"].includes(p.position));
-  }
-  if (zone === "midfield") {
-    return teamPlayers.filter(p => ["ZDM", "ZM", "LM", "RM", "ZOM"].includes(p.position));
-  }
-  if (zone === "attack") {
-    return teamPlayers.filter(p => ["ST", "MS", "LA", "RA", "HS"].includes(p.position));
-  }
-  return [];
-}
 
 const actionIndex = {
   tackle: 0,  // Tackling (Duel)
@@ -55,7 +40,6 @@ function weightedRandomChance(base, attacker, defender, modA, modD, spread = 0.1
 }
 
 function getActionForZone(zone, minute) {
-  // Zone-spezifische, realistischere Auswahl
   if (zone === "defense") {
     return Math.random() < 0.8 ? "pass" : "duel";
   }
@@ -81,14 +65,6 @@ function chooseOpponent(players) {
   return players[Math.floor(Math.random() * players.length)];
 }
 
-function killerPassSuccess(attacker, defender) {
-  // Tödlicher Pass: sehr schwer, hoher Reward
-  return weightedRandomChance(0.19, attacker.strength, defender.strength,
-    positionActionModifiers[attacker.position][actionIndex.pass],
-    positionActionModifiers[defender.position][actionIndex.tackle],
-    0.18);
-}
-
 function isFoul() {
   return Math.random() < 0.09;
 }
@@ -96,14 +72,65 @@ function isFoul() {
 function formatPlayerName(player) {
   if (!player) return "Unbekannt";
   if (player.name) return player.name;
-  return `${player.firstName || ""} ${player.lastName || ""}`.trim() || "Unbekannt";
+  return `${player.firstName || player.vorname || ""} ${player.lastName || player.nachname || ""}`.trim() || "Unbekannt";
 }
 
 function safePlayerRef(player) {
   return player && player.id ? player.id : null;
 }
 
-// ---- NEU: KICKOFF-STARTLOGIK ----
+function assignDetailPositions(players, lineup = null) {
+  if (lineup) {
+    return Object.entries(lineup)
+      .map(([detail, id]) => {
+        const p = players.find(sp => sp.id === id);
+        if (!p) return null;
+        return { ...p, position: detail || "IV" }; // Notfall-Fallback
+      })
+      .filter(Boolean);
+  }
+  // Sicherstellen, dass position **niemals** undefined ist!
+  return players.map(p => {
+    const posGroup = p.positionGroup || "";
+    const safePos = groupToDefaultDetail[posGroup] || "IV";
+    return { ...p, position: safePos };
+  });
+}
+
+
+function getPlayersByZone(teamPlayers, zone) {
+  if (zone === "defense") {
+    return teamPlayers.filter(p => ["IV", "LV", "RV", "TW"].includes(p.position));
+  }
+  if (zone === "midfield") {
+    return teamPlayers.filter(p => ["ZDM", "ZM", "LM", "RM", "ZOM"].includes(p.position));
+  }
+  if (zone === "attack") {
+    return teamPlayers.filter(p => ["ST", "MS", "LA", "RA", "HS"].includes(p.position));
+  }
+  return [];
+}
+
+function getMod(player, action) {
+  const mods = positionActionModifiers[player.position];
+  if (!mods) return 1; // Fallback: neutral
+  switch (action) {
+    case 'tackle': return mods[0];
+    case 'pass': return mods[1];
+    case 'dribble': return mods[2];
+    case 'shot': return mods[3];
+    default: return 1;
+  }
+}
+
+function killerPassSuccess(attacker, defender) {
+  return weightedRandomChance(0.19, attacker.strength, defender.strength,
+    getMod(attacker, 'pass'),
+    getMod(defender, 'tackle'),
+    0.18);
+}
+
+// ---- KICKOFF-STARTLOGIK ----
 function getKickoffState(homePlayers, awayPlayers, homeTeam, awayTeam, state) {
   const isHome = Math.random() < 0.5;
   const teamPlayers = isHome ? homePlayers : awayPlayers;
@@ -133,8 +160,10 @@ function getKickoffState(homePlayers, awayPlayers, homeTeam, awayTeam, state) {
 }
 
 // ---- Hauptfunktion ----
-function getNextGameState(state, homeTeam, awayTeam, homePlayers, awayPlayers) {
-  // KICKOFF-START, falls Minute 0 oder Daten fehlen
+function getNextGameState(state, homeTeam, awayTeam, rawHomePlayers, rawAwayPlayers, lineupHome = null, lineupAway = null) {
+  const homePlayers = assignDetailPositions(rawHomePlayers, lineupHome);
+  const awayPlayers = assignDetailPositions(rawAwayPlayers, lineupAway);
+
   if (
     !state ||
     !state.playerWithBall ||
@@ -145,7 +174,6 @@ function getNextGameState(state, homeTeam, awayTeam, homePlayers, awayPlayers) {
     return getKickoffState(homePlayers, awayPlayers, homeTeam, awayTeam, state || {});
   }
 
-  // Teams & Spieler bestimmen
   const possessionIsHome = state.possession === "home";
   const possessionTeam = possessionIsHome ? homeTeam : awayTeam;
   const oppositionTeam = possessionIsHome ? awayTeam : homeTeam;
@@ -162,34 +190,29 @@ function getNextGameState(state, homeTeam, awayTeam, homePlayers, awayPlayers) {
   let nextZone = zone;
   let score = { ...state.score };
 
-  // Spieler-Objekte finden
   let attacker = possessionPlayers.find(p => p.id === (state.playerWithBall?.id || state.playerWithBall)) || chooseOpponent(possessionPlayers);
   if (!attacker) attacker = chooseOpponent(possessionPlayers);
   let defenders = getPlayersByZone(oppositionPlayers, zone);
   if (!defenders.length) defenders = oppositionPlayers;
   let defender = chooseOpponent(defenders);
 
-  // Aktion auswählen
   let action = getActionForZone(zone, nextMinute);
   let isStandard = false;
 
-  // --- Aktionen ---
   switch (action) {
     case "pass": {
-      // Zielspieler finden
       const teammates = getPlayersByZone(possessionPlayers, zone).filter(p => p.id !== attacker.id);
       const target = teammates.length ? chooseOpponent(teammates) : attacker;
       const success =
-        weightedRandomChance(0.79,  // Höher für mehr Spielfluss!
+        weightedRandomChance(0.79,
           attacker.strength, defender.strength,
-          positionActionModifiers[attacker.position][actionIndex.pass],
-          positionActionModifiers[defender.position][actionIndex.tackle],
+          getMod(attacker, 'pass'),
+          getMod(defender, 'tackle'),
           0.10) > 0.5;
 
       if (success) {
         eventText = `${Math.round(nextMinute)}' – ${formatPlayerName(attacker)} spielt einen Pass zu ${formatPlayerName(target)}.`;
         nextPlayerWithBall = target;
-        // ggf. Zone vorwärts
         if (zone === "midfield" && ["ST", "MS", "LA", "RA", "HS"].includes(target.position)) {
           nextZone = "attack";
         } else if (zone === "defense" && ["ZDM", "ZM", "ZOM", "LM", "RM"].includes(target.position)) {
@@ -207,12 +230,11 @@ function getNextGameState(state, homeTeam, awayTeam, homePlayers, awayPlayers) {
       const success =
         weightedRandomChance(0.63,
           attacker.strength, defender.strength,
-          positionActionModifiers[attacker.position][actionIndex.dribble],
-          positionActionModifiers[defender.position][actionIndex.tackle],
+          getMod(attacker, 'dribble'),
+          getMod(defender, 'tackle'),
           0.13) > 0.5;
       if (success) {
         eventText = `${Math.round(nextMinute)}' – ${formatPlayerName(attacker)} setzt sich im Dribbling durch.`;
-        // Ball bleibt, ggf. Zone vorwärts
         if (zone === "midfield") nextZone = "attack";
         if (zone === "defense") nextZone = "midfield";
       } else {
@@ -238,7 +260,7 @@ function getNextGameState(state, homeTeam, awayTeam, homePlayers, awayPlayers) {
     case "killerPass": {
       const targets = getPlayersByZone(possessionPlayers, "attack");
       const target = targets.length ? chooseOpponent(targets) : attacker;
-      const success = killerPassSuccess(attacker, defender) > 0.57; // Extrem schwer!
+      const success = killerPassSuccess(attacker, defender) > 0.57;
 
       if (success) {
         eventText = `${Math.round(nextMinute)}' – Tödlicher Pass! ${formatPlayerName(attacker)} schickt ${formatPlayerName(target)} steil. Großchance!`;
@@ -259,14 +281,13 @@ function getNextGameState(state, homeTeam, awayTeam, homePlayers, awayPlayers) {
       const shootChance =
         weightedRandomChance(baseChance,
           attacker.strength, keeper.strength,
-          positionActionModifiers[attacker.position][actionIndex.shot],
-          positionActionModifiers[keeper.position][actionIndex.tackle],
+          getMod(attacker, 'shot'),
+          getMod(keeper, 'tackle'),
           0.13);
 
       if (shootChance > 0.63) {
         eventText = `${Math.round(nextMinute)}' – TOOOOR! ${formatPlayerName(attacker)} trifft gegen ${formatPlayerName(keeper)}!`;
         if (nextPossession === "home") score.home += 1; else score.away += 1;
-        // Nach Tor: Ballbesitzwechsel und Anstoß (Kickoff-Logik wiederholen)
         return getKickoffState(homePlayers, awayPlayers, homeTeam, awayTeam, {
           ...state,
           minute: nextMinute,
@@ -294,8 +315,8 @@ function getNextGameState(state, homeTeam, awayTeam, homePlayers, awayPlayers) {
       const success =
         weightedRandomChance(0.61,
           attacker.strength, defender.strength,
-          positionActionModifiers[attacker.position][actionIndex.tackle],
-          positionActionModifiers[defender.position][actionIndex.tackle],
+          getMod(attacker, 'tackle'),
+          getMod(defender, 'tackle'),
           0.11) > 0.5;
       if (success) {
         eventText = `${Math.round(nextMinute)}' – ${formatPlayerName(attacker)} gewinnt den Zweikampf gegen ${formatPlayerName(defender)}.`;
@@ -328,13 +349,12 @@ function getNextGameState(state, homeTeam, awayTeam, homePlayers, awayPlayers) {
       const shootChance =
         weightedRandomChance(baseChance,
           attacker.strength, keeper.strength,
-          positionActionModifiers[attacker.position][actionIndex.shot],
-          positionActionModifiers[keeper.position][actionIndex.tackle],
+          getMod(attacker, 'shot'),
+          getMod(keeper, 'tackle'),
           0.15);
       if (shootChance > 0.59) {
         eventText = `${Math.round(nextMinute)}' – Freistoß von ${formatPlayerName(attacker)} – TOOOOR!`;
         if (nextPossession === "home") score.home += 1; else score.away += 1;
-        // Nach Tor: Kickoff
         return getKickoffState(homePlayers, awayPlayers, homeTeam, awayTeam, {
           ...state,
           minute: nextMinute,
@@ -363,28 +383,10 @@ function getNextGameState(state, homeTeam, awayTeam, homePlayers, awayPlayers) {
       break;
   }
 
-  // Fallbacks, falls irgendwas fehlt
   if (!nextPlayerWithBall) nextPlayerWithBall = chooseOpponent(possessionPlayers);
 
   events.push({
     minute: Math.round(nextMinute),
     text: eventText,
     type: action,
-    possession: nextPossession,
-    playerWithBall: safePlayerRef(nextPlayerWithBall)
-  });
-
-  return {
-    ...state,
-    minute: nextMinute,
-    events,
-    ballPosition: nextZone,
-    possession: nextPossession,
-    playerWithBall: nextPlayerWithBall,
-    score,
-  };
-}
-
-module.exports = {
-  getNextGameState
-};
+    possession: next

@@ -1,14 +1,24 @@
 // firestore-seed.js
-const { initializeApp, applicationDefault } = require('firebase-admin/app');
+const { initializeApp } = require('firebase-admin/app');
 const { getFirestore } = require('firebase-admin/firestore');
-const { getAuth } = require('firebase-admin/auth');
 
-initializeApp({ projectId: 'deadlineday-sim' }); // <-- Trage HIER deinen echten Project-ID ein!
+initializeApp({ projectId: 'deadlineday-sim' });
+
 const db = getFirestore();
-const auth = getAuth();
+
+async function deleteCollection(collectionName) {
+  const snap = await db.collection(collectionName).get();
+  const deletes = snap.docs.map(doc => doc.ref.delete());
+  await Promise.all(deletes);
+}
 
 async function main() {
-  // --- User Accounts ---
+  // 1. Leere vorher alles!
+  await deleteCollection('players');
+  await deleteCollection('teams');
+  await deleteCollection('users');
+
+  // 2. User-Dokumente (NICHT im Auth, nur in Firestore!)
   const users = [
     {
       uid: "bayernUser",
@@ -24,7 +34,7 @@ async function main() {
     }
   ];
 
-  // --- Teams ---
+  // 3. Teams
   const teams = [
     {
       id: "fcb",
@@ -42,7 +52,7 @@ async function main() {
     }
   ];
 
-  // --- Spieler Bayern München (20 Beispiele, passe gerne nach Wunsch an) ---
+  // 4. Spieler Bayern München (20 Beispiele)
   const bayernSpieler = [
     { vorname: "Manuel", nachname: "Neuer", nationalitaet: "Deutschland", positionGroup: "TOR", strength: 91, avatarUrl: "", marktwert: 5000000, geburtsdatum: "1986-03-27" },
     { vorname: "Sven", nachname: "Ulreich", nationalitaet: "Deutschland", positionGroup: "TOR", strength: 79, avatarUrl: "", marktwert: 1000000, geburtsdatum: "1988-08-03" },
@@ -66,7 +76,7 @@ async function main() {
     { vorname: "Mathys", nachname: "Tel", nationalitaet: "Frankreich", positionGroup: "ATT", strength: 77, avatarUrl: "", marktwert: 30000000, geburtsdatum: "2005-04-27" },
   ];
 
-  // --- Spieler BVB (20 Beispiele) ---
+  // 5. Spieler BVB (20 Beispiele)
   const bvbSpieler = [
     { vorname: "Gregor", nachname: "Kobel", nationalitaet: "Schweiz", positionGroup: "TOR", strength: 86, avatarUrl: "", marktwert: 35000000, geburtsdatum: "1997-12-06" },
     { vorname: "Alexander", nachname: "Meyer", nationalitaet: "Deutschland", positionGroup: "TOR", strength: 75, avatarUrl: "", marktwert: 700000, geburtsdatum: "1991-04-13" },
@@ -90,17 +100,13 @@ async function main() {
     { vorname: "Marius", nachname: "Wolf", nationalitaet: "Deutschland", positionGroup: "DEF", strength: 77, avatarUrl: "", marktwert: 7000000, geburtsdatum: "1995-05-27" },
   ];
 
-  // --- In Firestore schreiben ---
-  // USERS
+  // 6. In Firestore schreiben
   for (const user of users) {
-    await auth.createUser({ uid: user.uid, email: user.email, displayName: user.displayName }).catch(() => {});
     await db.collection('users').doc(user.uid).set(user);
   }
-  // TEAMS
   for (const t of teams) {
     await db.collection('teams').doc(t.id).set(t);
   }
-  // SPIELER
   for (const p of bayernSpieler) {
     await db.collection('players').add({ ...p, teamId: "fcb" });
   }
@@ -108,7 +114,7 @@ async function main() {
     await db.collection('players').add({ ...p, teamId: "bvb" });
   }
 
-  console.log("Seed abgeschlossen!");
+  console.log("Seed abgeschlossen! (Nur Firestore)");
 }
 
 main();
