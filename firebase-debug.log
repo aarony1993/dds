@@ -1983,3 +1983,4 @@ SyntaxError: Unexpected end of input
     at Object.<anonymous> (H:\dds\functions\index.js:10:30)
 
 [debug] [2025-07-18T01:30:53.216Z] Got response code 400; body Failed to generate manifest from function source: SyntaxError: Unexpected end of input
+[error] !!  functions: Failed to load function definition from source: FirebaseError: Functions codebase could not be analyzed successfully. It may have a syntax or runtime error {"metadata":{"emulator":{"name":"functions"},"message":"Failed to load function definition from source: FirebaseError: Functions codebase could not be analyzed successfully. It may have a syntax or runtime error"}}
