@@ -1,5 +1,37 @@
 // simulationEngine.js
 
+/*************************************************
+ * Konfiguration / Tuning
+ *************************************************/
+const LOG_RATING_EVENTS = true;          // Hybrid: nur relevante Deltas loggen
+const ONE_EVENT_PER_TICK = true;         // Alle Deltas eines Ticks zusammenfassen
+const RATING_BASE = 600;                 // 6.00 Start
+const RATING_MIN = 100;                  // 1.00 Minimum
+const RATING_MAX = 1000;                 // 10.00 Maximum
+const RATING_DECAY_FACTOR = 0.002;       // leichte Regression pro Tick Richtung 6.0 (0 = aus)
+const PROGRESS_BONUS_CAP = 50;           // maximaler Bonus durch AttackTicks
+
+// Rating-Deltas (in Punkten, also 1 = 0.01 Note)
+const DELTAS = {
+  pass_success: +2,
+  pass_fail: -3,
+  progressive_pass_bonus: +1,        // zusätzlich zum pass_success
+  dribble_win: +4,
+  dribble_loss: -4,
+  duel_win: +3,
+  duel_loss: -3,
+  killer_pass_success: +6,
+  killer_pass_fail: -5,
+  shot_on_target: +5,                 // Schuss gehalten
+  goal: +18,
+  header_goal: +16,
+  freekick_goal: +20,
+  save: +5,                           // Keeper-Parade
+  concede_goal_keeper: -8,            // Tor kassiert (Torwart)
+  foul_drawn: +3,
+  foul_committed: -3
+};
+
 // Multiplikatoren für Detailpositionen und Aktionen
 const positionActionModifiers = {
   "TW":  [1.1, 0.7, 0.3, 0.2],
@@ -18,7 +50,6 @@ const positionActionModifiers = {
   "RA":  [0.6, 0.9, 1.2, 1.3],
 };
 
-// Default‑Detailposition pro Positionsgruppe
 const groupToDefaultDetail = {
   "DEF": "IV",
   "MID": "ZM",
@@ -26,7 +57,7 @@ const groupToDefaultDetail = {
   "TOR": "TW"
 };
 
-// Vorlagen für Aktionsbeschreibungen
+// Vorlagen für Aktionsbeschreibungen (mit {minute})
 const templates = {
   kickoff: [
     "Anstoß für {team}. {attacker} startet das Spiel.",
@@ -34,69 +65,83 @@ const templates = {
     "Spielbeginn für {team}, {attacker} führt den Anstoß aus."
   ],
   pass: [
-    "{attacker} spielt einen präzisen Pass zu {target}.",
-    "{attacker} steckt den Ball auf {target} durch.",
-    "{attacker} findet mit seinem Zuspiel {target}.",
-    "Feiner Pass von {attacker} auf {target}."
+    "{minute}' – {attacker} spielt einen präzisen Pass zu {target}.",
+    "{minute}' – {attacker} steckt den Ball auf {target} durch.",
+    "{minute}' – Feiner Pass von {attacker} auf {target}."
+  ],
+  pass_intercept: [
+    "{minute}' – {defender} fängt den Pass von {attacker} ab!"
   ],
   dribble: [
-    "{attacker} setzt sich im Dribbling durch.",
-    "Gelungener Dribbling-Versuch von {attacker}.",
-    "{attacker} tanzt mit dem Ball am Fuß.",
+    "{minute}' – {attacker} setzt sich im Dribbling durch.",
+    "{minute}' – Gelungener Dribbling-Versuch von {attacker}.",
+    "{minute}' – {attacker} tanzt mit dem Ball am Fuß."
+  ],
+  dribble_lost: [
+    "{minute}' – {defender} nimmt {attacker} den Ball im Dribbling ab!"
   ],
   killerPass: [
-    "Tödlicher Pass von {attacker} auf {target} – Großchance!",
-    "{attacker} spielt den tödlichen Pass zu {target}.",
+    "{minute}' – Tödlicher Pass von {attacker} auf {target} – Großchance!",
+    "{minute}' – {attacker} spielt den tödlichen Pass zu {target}."
   ],
-  duel: [
-    "{attacker} gewinnt den Zweikampf gegen {target}.",
-    "Starker Zweikampf von {attacker} gegen {target}.",
+  killerPass_fail: [
+    "{minute}' – {defender} unterbindet den Killerpass von {attacker}!"
+  ],
+  duel_win: [
+    "{minute}' – {attacker} gewinnt den Zweikampf gegen {defender}.",
+    "{minute}' – Starker Zweikampf von {attacker} gegen {defender}."
+  ],
+  duel_loss: [
+    "{minute}' – {defender} setzt sich im Zweikampf gegen {attacker} durch."
   ],
   shoot: [
-    "{attacker} zieht aus der Distanz ab.",
-    "Schussversuch von {attacker} aufs Tor.",
+    "{minute}' – {attacker} zieht aus der Distanz ab.",
+    "{minute}' – Schussversuch von {attacker} aufs Tor."
   ],
   header: [
-    "Kopfball von {attacker} auf {target}.",
-    "{attacker} verlängert per Kopf zu {target}.",
+    "{minute}' – {attacker} setzt zum Kopfball an!"
   ],
   goal: [
-    "TOOOOR! {attacker} trifft gegen {goalkeeper}.",
-    "Jubel! {attacker} überwindet {goalkeeper}.",
+    "{minute}' – TOOOOR! {attacker} trifft gegen {goalkeeper}.",
+    "{minute}' – Jubel! {attacker} überwindet {goalkeeper}."
+  ],
+  save: [
+    "{minute}' – {goalkeeper} pariert gegen {attacker}.",
+    "{minute}' – Glanzparade von {goalkeeper} gegen {attacker}."
   ],
   foul: [
-    "Foul an {attacker}. Freistoß für {team}.",
-    "{attacker} wird gefoult – Freistoßpunkte für {team}.",
+    "{minute}' – Foul an {attacker}. Freistoß für {team}.",
+    "{minute}' – {attacker} wird gefoult – Freistoß für {team}."
   ],
   freekick: [
-    "Freistoß von {attacker}.",
-    "{attacker} legt sich den Ball für den Freistoß zurecht.",
+    "{minute}' – Freistoß von {attacker}.",
+    "{minute}' – {attacker} tritt den Freistoß."
+  ],
+  freekick_saved: [
+    "{minute}' – Freistoß von {attacker} – {goalkeeper} hält!"
   ]
 };
 
-// Hilfsfunktionen
+/*************************************************
+ * Hilfsfunktionen
+ *************************************************/
 function normalizePosition(pos) {
   return (typeof pos === "string") ? pos.replace(/\d+$/, "") : pos;
 }
 function weightedRandomChance(base, atk, def, modA, modD, spread = 0.15) {
   const ratingA = atk * modA;
   const ratingD = def * modD;
-  const diff    = (ratingA - ratingD) / 50;
+  const diff    = (ratingA - ratingD) / 70; // etwas defensiver
   const luck    = (Math.random()*2 - 1)*spread;
   return base + diff + luck;
 }
-function choosePlayer(arr) {
-  return arr && arr.length ? arr[Math.floor(Math.random()*arr.length)] : null;
-}
+function choosePlayer(arr) { return arr && arr.length ? arr[Math.floor(Math.random()*arr.length)] : null; }
 function formatName(p) {
   if (!p) return "Unbekannt";
   return p.name || `${p.firstName||p.vorname||""} ${p.lastName||p.nachname||""}`.trim() || "Unbekannt";
 }
-function safePlayerRef(p) {
-  return p && p.id ? p.id : null;
-}
+function safePlayerRef(p) { return p && p.id ? p.id : null; }
 
-// Lineup-Filter & Positionszuweisung
 function assignDetail(players, lineup) {
   const inLineup = lineup ? Object.values(lineup) : null;
   const pool     = inLineup ? players.filter(p=>inLineup.includes(p.id)) : players;
@@ -125,6 +170,7 @@ function getMod(p, act) {
     default: return 1;
   }
 }
+
 function getPlayersByZone(players, zone) {
   const map = {
     defense: ["IV","LV","RV","TW"],
@@ -146,9 +192,7 @@ function getPreviousRelativeZone(z) {
   if (z==="midfield")return "defense";
   return null;
 }
-function buildZone(team, rel) {
-  return `${team}${rel.charAt(0).toUpperCase()+rel.slice(1)}`;
-}
+function buildZone(team, rel) { return `${team}${rel.charAt(0).toUpperCase()+rel.slice(1)}`; }
 function parseZone(ctx) {
   if (!ctx) return {};
   const team = ctx.startsWith("home")?"home":"away";
@@ -168,33 +212,60 @@ function opponentZone(ctx) {
 function chooseAction(rel) {
   const r=Math.random();
   if (rel==="midfield") {
-    if (r<0.45) return "pass";
-    if (r<0.70) return "dribble";
-    if (r<0.77) return "killerPass";
+    if (r<0.48) return "pass";
+    if (r<0.72) return "dribble";
+    if (r<0.78) return "killerPass";
     return "duel";
   }
   if (rel==="attack") {
-    if (r<0.32) return "pass";
-    if (r<0.42) return "dribble";
-    if (r<0.77) return "shoot";
+    if (r<0.39) return "pass";
+    if (r<0.50) return "dribble";
+    if (r<0.66) return "shoot"; // reduziert
     return "duel";
   }
-  return r<0.8?"pass":"duel";
+  return r<0.82?"pass":"duel";
 }
 
-// Zufällige Beschreibung aus Vorlagen
-function describe(type,data) {
-  const arr=templates[type];
+// Text-Template
+function describe(type, data) {
+  const arr = templates[type];
   if (!arr) return "";
-  let txt=arr[Math.floor(Math.random()*arr.length)];
-  return txt
-    .replace(/{attacker}/g, data.attacker)
-    .replace(/{target}/g, data.target||"")
-    .replace(/{team}/g, data.team||"")
-    .replace(/{goalkeeper}/g,data.goalkeeper||"");
+  let txt = arr[Math.floor(Math.random()*arr.length)];
+  Object.entries(data||{}).forEach(([k,v])=>{
+    txt = txt.replace(new RegExp(`{${k}}`,'g'), v||"");
+  });
+  return txt;
 }
 
-// Kickoff-Ereignis (nach Tor oder Spielstart)
+/*************************************************
+ * Rating Utility
+ *************************************************/
+function initRatings(players, existingMap) {
+  const map = existingMap ? {...existingMap} : {};
+  players.forEach(p=>{
+    if (!map[p.id]) map[p.id] = RATING_BASE;
+  });
+  return map;
+}
+function clamp(val,min,max){ return val<min?min:val>max?max:val; }
+function applyDelta(ratings, playerId, delta, deltasAcc) {
+  if (!playerId) return;
+  if (ratings[playerId] === undefined) ratings[playerId] = RATING_BASE;
+  ratings[playerId] = clamp(ratings[playerId] + delta, RATING_MIN, RATING_MAX);
+  if (delta !== 0) deltasAcc[playerId] = (deltasAcc[playerId]||0) + delta;
+}
+function decayRatings(ratings) {
+  if (RATING_DECAY_FACTOR <= 0) return;
+  const center = RATING_BASE;
+  Object.keys(ratings).forEach(id=>{
+    const diff = ratings[id] - center;
+    ratings[id] = ratings[id] - diff * RATING_DECAY_FACTOR;
+  });
+}
+
+/*************************************************
+ * Kickoff
+ *************************************************/
 function getKickoffState(home,away,homeTeam,awayTeam,state) {
   const isHome=Math.random()<0.5;
   const teamPl = isHome?home:away;
@@ -204,6 +275,8 @@ function getKickoffState(home,away,homeTeam,awayTeam,state) {
   const zone   = buildZone(isHome?"home":"away","midfield");
   const text   = describe("kickoff",{team:teamInf.name,attacker:formatName(kick)});
   const evt={ minute: Math.round(state.minute), text, type:"kickoff", possession: state.possession, playerWithBall: safePlayerRef(kick) };
+
+  // Rating: neutral (kein Delta)
   return {
     ...state,
     events: [...state.events,evt],
@@ -215,17 +288,32 @@ function getKickoffState(home,away,homeTeam,awayTeam,state) {
   };
 }
 
-// Haupt‐Simulations‐Funktion
+/*************************************************
+ * Hauptfunktion
+ *************************************************/
 function getNextGameState(state,homeTeam,awayTeam,rawHome,rawAway,lineupHome=null,lineupAway=null) {
   const home=assignDetail(rawHome,lineupHome);
   const away=assignDetail(rawAway,lineupAway);
 
-  // Initialisierung
-  if (!state||!state.playerWithBall) {
-    return getKickoffState(home,away,homeTeam,awayTeam,{
-      minute:0, possession:null, playerWithBall:null, ballZone:null,
-      events:[], score:{home:0,away:0}, justWonDuel:false, attackTicks:0
-    });
+  // Ratings initialisieren / zusammenführen (nur aufgestellte)
+  const playerRatings = initRatings([...home, ...away], state?.playerRatings);
+
+  if (!state || !state.playerWithBall) {
+    return getKickoffState(
+      home, away, homeTeam, awayTeam,
+      {
+        minute:0,
+        possession:null,
+        playerWithBall:null,
+        ballZone:null,
+        events:[],
+        score:{home:0,away:0},
+        justWonDuel:false,
+        attackTicks:0,
+        playerRatings,
+        ratingEventsBuffer: []
+      }
+    );
   }
 
   const isHome     = state.possession==="home";
@@ -243,44 +331,48 @@ function getNextGameState(state,homeTeam,awayTeam,rawHome,rawAway,lineupHome=nul
   let action     = chooseAction(curRel);
   let text       = "";
 
-  // Auswahl Ballführer (nur im Lineup und zonengerecht)
-  let poolAtt = poss.filter(p=>true);
-  if (curRel!="attack") poolAtt = poolAtt.filter(p=>!["ST","MS","LA","RA","HS"].includes(normalizePosition(p.position)));
-  if (curRel==="attack") {
+  // Deltas-Akkumulator (playerId -> deltaPoints)
+  const tickDeltas = {};
+
+  // Ballführer Auswahl
+  let poolAtt = poss;
+  if (curRel!=="attack")
+    poolAtt = poolAtt.filter(p=>!["ST","MS","LA","RA","HS"].includes(normalizePosition(p.position)));
+  else {
     const str = poss.filter(p=>["ST","MS","LA","RA","HS"].includes(normalizePosition(p.position)));
     if (str.length) poolAtt=str;
   }
   let attacker = poolAtt.find(p=>p.id===state.playerWithBall.id)||choosePlayer(poolAtt)||choosePlayer(poss);
 
-  // Defender in relevanter Zone
+  // Defender
   const defZone = parseZone(opponentZone(state.ballZone)).rel;
-  let defList = getPlayersByZone(opp.filter(p=>normalizePosition(p.position)!="TW"),defZone);
-  if (!defList.length) defList = opp.filter(p=>normalizePosition(p.position)!="TW");
+  let defList = getPlayersByZone(opp.filter(p=>normalizePosition(p.position)!=="TW"),defZone);
+  if (!defList.length) defList = opp.filter(p=>normalizePosition(p.position)!=="TW");
   let defender = choosePlayer(defList)||{id:"dummy",strength:1,position:"IV"};
 
-  // justWonDuel‑Unterbrechung
+  // justWonDuel-Kette unterbrechen
   if (state.justWonDuel && action==="duel") {
     action="pass";
-    text=describe("pass",{attacker:formatName(attacker),target:formatName(attacker)});
+    text=describe("pass",{minute:Math.round(currentMin),attacker:formatName(attacker),target:formatName(attacker)});
     nextPlayer=attacker;
     nextZone=buildZone(ballTeam,"midfield");
   }
   state.justWonDuel=false;
 
-  // Abwehrspieler-Regel
+  // Abwehrspieler Einschränkungen
   const isDef = isDefensive(attacker);
-  const isGoalie = normalizePosition(attacker.position)==="TW";
-  if (isDef && !isGoalie && (action==="shoot"||action==="killerPass"||(action==="dribble"&&curRel==="attack"))) {
+  const isGK  = normalizePosition(attacker.position)==="TW";
+  if (isDef && !isGK && (action==="shoot"||action==="killerPass"||(action==="dribble"&&curRel==="attack"))) {
     action="pass";
-    text=describe("pass",{attacker:formatName(attacker),target:formatName(attacker)});
+    text=describe("pass",{minute:Math.round(currentMin),attacker:formatName(attacker),target:formatName(attacker)});
     nextPlayer=attacker;
     nextZone=buildZone(ballTeam,curRel);
   }
 
-  // Aktion ausführen
+  /******** Aktionen ********/
   switch(action) {
     case "pass": {
-      const mates = poss.filter(p=>p.id!==attacker.id&&normalizePosition(p.position)!="TW");
+      const mates = poss.filter(p=>p.id!==attacker.id && normalizePosition(p.position)!=="TW");
       const nRel= getNextRelativeZone(curRel);
       const pRel= getPreviousRelativeZone(curRel);
       let tgt=null,tgtRel=curRel;
@@ -288,111 +380,230 @@ function getNextGameState(state,homeTeam,awayTeam,rawHome,rawAway,lineupHome=nul
       if(!tgt){ const arr=getPlayersByZone(mates,curRel); if(arr.length){tgt=choosePlayer(arr);} }
       if(!tgt&&pRel){ const arr=getPlayersByZone(mates,pRel); if(arr.length){tgt=choosePlayer(arr);tgtRel=pRel;} }
       if(!tgt) tgt=choosePlayer(mates)||attacker;
-      let base=0.79, dmod=getMod(defender,"tackle"); if(tgtRel===nRel){base=0.85; dmod*=0.8;}
-      if(weightedRandomChance(base,attacker.strength,defender.strength,getMod(attacker,"pass"),dmod,0.1)>0.5) {
-        text=describe("pass",{attacker:formatName(attacker),target:formatName(tgt)});
+
+      let base=0.78, dmod=getMod(defender,"tackle");
+      if(tgtRel===nRel){base=0.82; dmod*=0.9;}
+      const success = weightedRandomChance(base,attacker.strength,defender.strength,getMod(attacker,"pass"),dmod,0.09)>0.5;
+      if (success) {
+        text=describe("pass",{minute:Math.round(currentMin),attacker:formatName(attacker),target:formatName(tgt)});
         nextPlayer=tgt;
         nextZone=buildZone(ballTeam,tgtRel);
+        applyDelta(playerRatings, attacker.id, DELTAS.pass_success, tickDeltas);
+        if(tgtRel===nRel) applyDelta(playerRatings, attacker.id, DELTAS.progressive_pass_bonus, tickDeltas);
       } else {
-        text=describe("pass",{attacker:formatName(attacker),target:formatName(defender)});
+        text=describe("pass_intercept",{minute:Math.round(currentMin),attacker:formatName(attacker),defender:formatName(defender)});
         nextPoss=oppTeam;
         nextPlayer=defender;
         nextZone=buildZone(oppTeam,"defense");
+        applyDelta(playerRatings, attacker.id, DELTAS.pass_fail, tickDeltas);
+        applyDelta(playerRatings, defender.id, DELTAS.pass_success, tickDeltas); // kleiner Bonus für Interception
       }
       break;
     }
     case "dribble": {
-      if(weightedRandomChance(0.63,attacker.strength,defender.strength,getMod(attacker,"dribble"),getMod(defender,"tackle"),0.13)>0.5) {
+      const success = weightedRandomChance(
+        0.55,attacker.strength,defender.strength,
+        getMod(attacker,"dribble"),getMod(defender,"tackle"),0.10)>0.5;
+      if (success) {
         if(curRel==="attack") {
           action="shoot";
-          text=describe("shoot",{attacker:formatName(attacker)});
+          text=describe("shoot",{minute:Math.round(currentMin),attacker:formatName(attacker)});
           nextPlayer=attacker;
           nextZone=buildZone(ballTeam,"attack");
+          applyDelta(playerRatings, attacker.id, DELTAS.dribble_win, tickDeltas);
         } else if(["LM","RM"].includes(normalizePosition(attacker.position))) {
           action="header";
           const hdr=choosePlayer(getPlayersByZone(poss,"attack"))||attacker;
-          text=describe("header",{attacker:formatName(attacker),target:formatName(hdr)});
+            text=describe("header",{minute:Math.round(currentMin),attacker:formatName(attacker),target:formatName(hdr)});
           nextPlayer=hdr; nextZone=buildZone(ballTeam,"attack");
+          applyDelta(playerRatings, attacker.id, DELTAS.dribble_win, tickDeltas);
         } else {
           const nr=getNextRelativeZone(curRel)||curRel;
-          text=describe("dribble",{attacker:formatName(attacker)});
+          text=describe("dribble",{minute:Math.round(currentMin),attacker:formatName(attacker)});
           nextPlayer=attacker;
-          nextZone=buildZone(ballTeam,isDef?"midfield":nr);
+          nextZone=buildZone(ballTeam,isDefensive(attacker)?"midfield":nr);
+          applyDelta(playerRatings, attacker.id, DELTAS.dribble_win, tickDeltas);
         }
       } else {
-        text=describe("duel",{attacker:formatName(defender),target:formatName(attacker)});
+        text=describe("dribble_lost",{minute:Math.round(currentMin),attacker:formatName(attacker),defender:formatName(defender)});
         nextPoss=oppTeam; nextPlayer=defender; nextZone=buildZone(oppTeam,"defense");
+        applyDelta(playerRatings, attacker.id, DELTAS.dribble_loss, tickDeltas);
+        applyDelta(playerRatings, defender.id, DELTAS.duel_win, tickDeltas);
       }
       break;
     }
     case "killerPass": {
       const tgtList=getPlayersByZone(poss,"attack");
       const tgt=tgtList.length?choosePlayer(tgtList):attacker;
-      if(weightedRandomChance(0.19,attacker.strength,defender.strength,getMod(attacker,"pass"),getMod(defender,"tackle"),0.18)>0.57) {
-        text=describe("killerPass",{attacker:formatName(attacker),target:formatName(tgt)});
+      const success = weightedRandomChance(
+        0.19,attacker.strength,defender.strength,
+        getMod(attacker,"pass"),getMod(defender,"tackle"),0.18)>0.57;
+      if (success) {
+        text=describe("killerPass",{minute:Math.round(currentMin),attacker:formatName(attacker),target:formatName(tgt)});
         nextPlayer=tgt;
-        nextZone=buildZone(ballTeam,isDef?"midfield":"attack");
+        nextZone=buildZone(ballTeam,isDefensive(attacker)?"midfield":"attack");
+        applyDelta(playerRatings, attacker.id, DELTAS.killer_pass_success, tickDeltas);
       } else {
-        text=describe("duel",{attacker:formatName(defender),target:formatName(attacker)});
+        text=describe("killerPass_fail",{minute:Math.round(currentMin),attacker:formatName(attacker),defender:formatName(defender)});
         nextPoss=oppTeam; nextPlayer=defender; nextZone=buildZone(oppTeam,"defense");
+        applyDelta(playerRatings, attacker.id, DELTAS.killer_pass_fail, tickDeltas);
+        applyDelta(playerRatings, defender.id, DELTAS.pass_success, tickDeltas);
       }
       break;
     }
     case "header": {
       const kpr=choosePlayer(getPlayersByZone(opp,"defense").filter(p=>normalizePosition(p.position)==="TW"))||defender;
-      if(weightedRandomChance(0.45,attacker.strength,kpr.strength,getMod(attacker,"shot"),getMod(kpr,"tackle"),0.1)>0.5) {
-        text=describe("goal",{attacker:formatName(attacker),goalkeeper:formatName(kpr)});
+      const success = weightedRandomChance(
+        0.23, attacker.strength, kpr.strength,
+        getMod(attacker,"shot"), getMod(kpr,"tackle"), 0.08)>0.65;
+      if (success) {
+        const goalText=describe("goal",{minute:Math.round(currentMin),attacker:formatName(attacker),goalkeeper:formatName(kpr)});
         nextScore[ballTeam]++;
-        return getKickoffState(home,away,homeTeam,awayTeam,{...state,minute:currentMin,events:[...state.events,{minute:Math.round(currentMin),text,type:'goal',possession:ballTeam,playerWithBall:safePlayerRef(attacker)}],score:nextScore,justWonDuel:false,attackTicks:0,kickoffActive:false});
+        applyDelta(playerRatings, attacker.id, DELTAS.header_goal, tickDeltas);
+        if (normalizePosition(kpr.position)==="TW")
+          applyDelta(playerRatings, kpr.id, DELTAS.concede_goal_keeper, tickDeltas);
+
+        // Goal Event
+        const goalEvent = {
+          minute: Math.round(currentMin),
+          text: goalText,
+          type: 'goal',
+          possession: ballTeam,
+          playerWithBall: safePlayerRef(attacker),
+          scorer: safePlayerRef(attacker),
+          against: safePlayerRef(kpr)
+        };
+        const newStateAfterGoal = {
+          ...state,
+          minute: currentMin,
+          events: [...state.events, goalEvent],
+          score: nextScore,
+          justWonDuel:false,
+          attackTicks:0,
+          playerRatings,
+          ratingEventsBuffer: appendRatingEvents(state.ratingEventsBuffer, tickDeltas, goalEvent.minute, 'goal')
+        };
+        return getKickoffState(home,away,homeTeam,awayTeam,newStateAfterGoal);
       } else {
-        text=describe("header",{attacker:formatName(attacker),target:formatName(kpr)});
+        text=describe("save",{minute:Math.round(currentMin),goalkeeper:formatName(kpr),attacker:formatName(attacker)});
         nextPoss=oppTeam; nextPlayer=kpr; nextZone=buildZone(oppTeam,"defense");
+        applyDelta(playerRatings, attacker.id, DELTAS.shot_on_target, tickDeltas);
+        if (normalizePosition(kpr.position)==="TW")
+          applyDelta(playerRatings, kpr.id, DELTAS.save, tickDeltas);
       }
       break;
     }
     case "shoot": {
       const kpr=choosePlayer(getPlayersByZone(opp,"defense").filter(p=>normalizePosition(p.position)==="TW"))||defender;
-      if(weightedRandomChance(0.25+(state.attackTicks||0)*0.01,attacker.strength,kpr.strength,getMod(attacker,"shot"),getMod(kpr,"tackle"),0.13)>0.63) {
-        text=describe("goal",{attacker:formatName(attacker),goalkeeper:formatName(kpr)});
+      const success = weightedRandomChance(
+        0.15+(state.attackTicks||0)*0.008,
+        attacker.strength,kpr.strength,
+        getMod(attacker,"shot"),getMod(kpr,"tackle"),0.08)>0.70;
+      if (success) {
+        const goalText=describe("goal",{minute:Math.round(currentMin),attacker:formatName(attacker),goalkeeper:formatName(kpr)});
         nextScore[ballTeam]++;
-        return getKickoffState(home,away,homeTeam,awayTeam,{...state,minute:currentMin,events:[...state.events,{minute:Math.round(currentMin),text,type:'goal',possession:ballTeam,playerWithBall:safePlayerRef(attacker)}],score:nextScore,justWonDuel:false,attackTicks:0,kickoffActive:false});
+        applyDelta(playerRatings, attacker.id, DELTAS.goal, tickDeltas);
+        if (normalizePosition(kpr.position)==="TW")
+          applyDelta(playerRatings, kpr.id, DELTAS.concede_goal_keeper, tickDeltas);
+
+        const goalEvent = {
+          minute: Math.round(currentMin),
+            text: goalText,
+          type: 'goal',
+          possession: ballTeam,
+          playerWithBall: safePlayerRef(attacker),
+          scorer: safePlayerRef(attacker),
+          against: safePlayerRef(kpr)
+        };
+        const newStateAfterGoal = {
+          ...state,
+          minute: currentMin,
+          events: [...state.events, goalEvent],
+          score: nextScore,
+          justWonDuel:false,
+          attackTicks:0,
+          playerRatings,
+          ratingEventsBuffer: appendRatingEvents(state.ratingEventsBuffer, tickDeltas, goalEvent.minute, 'goal')
+        };
+        return getKickoffState(home,away,homeTeam,awayTeam,newStateAfterGoal);
       } else {
-        text=describe("shoot",{attacker:formatName(attacker)}).replace('{attacker}',formatName(attacker));
+        text=describe("save",{minute:Math.round(currentMin),goalkeeper:formatName(kpr),attacker:formatName(attacker)});
         nextPoss=oppTeam; nextPlayer=kpr; nextZone=buildZone(oppTeam,"defense");
+        applyDelta(playerRatings, attacker.id, DELTAS.shot_on_target, tickDeltas);
+        if (normalizePosition(kpr.position)==="TW")
+          applyDelta(playerRatings, kpr.id, DELTAS.save, tickDeltas);
       }
       break;
     }
     case "duel": {
-      const defList2=getPlayersByZone(opp,curRel).filter(p=>normalizePosition(p.position)!="TW");
+      const defList2=getPlayersByZone(opp,curRel).filter(p=>normalizePosition(p.position)!=="TW");
       defender=choosePlayer(defList2)||defender;
-      const succ=weightedRandomChance(0.61,attacker.strength,defender.strength,getMod(attacker,"tackle"),getMod(defender,"tackle"),0.11)>0.5;
+      const succ=weightedRandomChance(
+        0.61,attacker.strength,defender.strength,
+        getMod(attacker,"tackle"),getMod(defender,"tackle"),0.11)>0.5;
       if(succ) {
-        text=describe("duel",{attacker:formatName(attacker),target:formatName(defender)});
+        text=describe("duel_win",{minute:Math.round(currentMin),attacker:formatName(attacker),defender:formatName(defender)});
         nextPlayer=attacker;
         if(curRel==="defense")      nextZone=buildZone(ballTeam,"midfield");
-        else if(curRel==="midfield")nextZone=buildZone(ballTeam,isDef?"midfield":"attack");
-        else                          nextZone=state.ballZone;
+        else if(curRel==="midfield")nextZone=buildZone(ballTeam,isDefensive(attacker)?"midfield":"attack");
+        else                        nextZone=state.ballZone;
         state.justWonDuel=true;
+        applyDelta(playerRatings, attacker.id, DELTAS.duel_win, tickDeltas);
+        applyDelta(playerRatings, defender.id, DELTAS.duel_loss, tickDeltas);
       } else {
         if(Math.random()<0.09) {
-          text=describe("foul",{attacker:formatName(attacker),team:(ballTeam==='home'?homeTeam.name:awayTeam.name)});
-          action="freekick"; nextZone=state.ballZone;
+          // Foul
+          text=describe("foul",{minute:Math.round(currentMin),attacker:formatName(attacker),team:(ballTeam==='home'?homeTeam.name:awayTeam.name)});
+          action="freekick";
+          nextZone=state.ballZone;
+          applyDelta(playerRatings, attacker.id, DELTAS.foul_drawn, tickDeltas);
+          applyDelta(playerRatings, defender.id, DELTAS.foul_committed, tickDeltas);
         } else {
-          text=describe("duel",{attacker:formatName(defender),target:formatName(attacker)});
+          text=describe("duel_loss",{minute:Math.round(currentMin),attacker:formatName(attacker),defender:formatName(defender)});
           nextPoss=oppTeam; nextPlayer=defender; nextZone=buildZone(oppTeam,"defense");
+          applyDelta(playerRatings, attacker.id, DELTAS.duel_loss, tickDeltas);
+          applyDelta(playerRatings, defender.id, DELTAS.duel_win, tickDeltas);
         }
       }
       break;
     }
     case "freekick": {
       const kpr2=choosePlayer(getPlayersByZone(opp,"defense").filter(p=>normalizePosition(p.position)==="TW"))||defender;
-      if(weightedRandomChance(0.32,attacker.strength,kpr2.strength,getMod(attacker,"shot"),getMod(kpr2,"tackle"),0.15)>0.59) {
-        text=describe("goal",{attacker:formatName(attacker),goalkeeper:formatName(kpr2)});
+      const success = weightedRandomChance(
+        0.19,attacker.strength,kpr2.strength,
+        getMod(attacker,"shot"),getMod(kpr2,"tackle"),0.12)>0.69;
+      if (success) {
+        const goalText=describe("goal",{minute:Math.round(currentMin),attacker:formatName(attacker),goalkeeper:formatName(kpr2)});
         nextScore[ballTeam]++;
-        return getKickoffState(home,away,homeTeam,awayTeam,{...state,minute:currentMin,events:[...state.events,{minute:Math.round(currentMin),text,type:'freekick',possession:ballTeam,playerWithBall:safePlayerRef(attacker)}],score:nextScore,justWonDuel:false,attackTicks:0,kickoffActive:false});
+        applyDelta(playerRatings, attacker.id, DELTAS.freekick_goal, tickDeltas);
+        if (normalizePosition(kpr2.position)==="TW")
+          applyDelta(playerRatings, kpr2.id, DELTAS.concede_goal_keeper, tickDeltas);
+        const goalEvent = {
+          minute: Math.round(currentMin),
+          text: goalText,
+          type: 'goal',
+          possession: ballTeam,
+          playerWithBall: safePlayerRef(attacker),
+          scorer: safePlayerRef(attacker),
+          against: safePlayerRef(kpr2)
+        };
+        const newStateAfterGoal = {
+          ...state,
+          minute: currentMin,
+          events: [...state.events, goalEvent],
+          score: nextScore,
+          justWonDuel:false,
+          attackTicks:0,
+          playerRatings,
+          ratingEventsBuffer: appendRatingEvents(state.ratingEventsBuffer, tickDeltas, goalEvent.minute, 'goal')
+        };
+        return getKickoffState(home,away,homeTeam,awayTeam,newStateAfterGoal);
       } else {
-        text=describe("freekick",{attacker:formatName(attacker)}) + ` – gehalten von ${formatName(kpr2)}.`;
+        text=describe("freekick_saved",{minute:Math.round(currentMin),attacker:formatName(attacker),goalkeeper:formatName(kpr2)});
         nextPoss=oppTeam; nextPlayer=kpr2; nextZone=buildZone(oppTeam,"defense");
+        applyDelta(playerRatings, attacker.id, DELTAS.shot_on_target, tickDeltas);
+        if (normalizePosition(kpr2.position)==="TW")
+          applyDelta(playerRatings, kpr2.id, DELTAS.save, tickDeltas);
       }
       break;
     }
@@ -402,9 +613,62 @@ function getNextGameState(state,homeTeam,awayTeam,rawHome,rawAway,lineupHome=nul
       break;
   }
 
+  // Decay (nach Aktion)
+  decayRatings(playerRatings);
+
+  // RatingEvents (nur wenn Deltas)
+  const ratingEventsBuffer = appendRatingEvents(state.ratingEventsBuffer, tickDeltas, Math.round(currentMin), action);
+
   // Event anhängen
   const evt={minute:Math.round(currentMin),text,type:action,possession:nextPoss,playerWithBall:safePlayerRef(nextPlayer)};
-  return {minute:currentMin,possession:nextPoss,playerWithBall:nextPlayer,ballZone:nextZone,events:[...state.events,evt],score:nextScore,justWonDuel:state.justWonDuel,attackTicks:(nextPoss===state.possession && nextZone.endsWith("Attack"))?(state.attackTicks||0)+1:0};
+
+  return {
+    minute:currentMin,
+    possession:nextPoss,
+    playerWithBall:nextPlayer,
+    ballZone:nextZone,
+    events:[...state.events,evt],
+    score:nextScore,
+    justWonDuel:state.justWonDuel,
+    attackTicks:(nextPoss===state.possession && nextZone.endsWith("Attack"))?(state.attackTicks||0)+1:0,
+    playerRatings,
+    ratingEventsBufferI
+  };
 }
 
-module.exports={getNextGameState};
+/*************************************************
+ * Rating Events Buffer Helper
+ *************************************************/
+function appendRatingEvents(buffer, tickDeltas, minute, actionTag) {
+  if (!LOG_RATING_EVENTS) return buffer || [];
+  const deltaKeys = Object.keys(tickDeltas);
+  if (!deltaKeys.length) return buffer || [];
+  if (!buffer) buffer = [];
+
+  if (ONE_EVENT_PER_TICK) {
+    // Zusammenfassen in ein Objekt
+    buffer.push({
+      minute,
+      actionTag,
+      deltas: tickDeltas,      // {playerId: deltaPoints}
+      timestamp: Date.now()
+    });
+  } else {
+    // Einzelne Einträge pro Spieler
+    deltaKeys.forEach(pid=>{
+      buffer.push({
+        minute,
+        actionTag,
+        playerId: pid,
+        delta: tickDeltas[pid],
+        timestamp: Date.now()
+      });
+    });
+  }
+  return buffer;
+}
+
+/*************************************************
+ * Export
+ *************************************************/
+module.exports = { getNextGameState };
