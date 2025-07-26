@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect } from "react";
 import {
   Box,
@@ -21,7 +20,7 @@ import {
 } from "@mui/material";
 import { useAuth } from "../context/AuthContext";
 import { db } from "../firebase/config";
-import { collection, query, where, getDocs, doc, updateDoc } from "firebase/firestore";
+import { collection, query, where, getDocs, doc, getDoc, updateDoc } from "firebase/firestore";
 
 // --- Mapping Feldposition => Positionsgruppe
 // --- Mapping Feldposition => Positionsgruppe nach deinem Seed
@@ -41,7 +40,6 @@ const positionGroupMapping = {
   "LA": "ATT",
   "RA": "ATT"
 };
-
 
 // --- Flaggen Mapping
 const flagEmoji = (country) => {
@@ -125,103 +123,81 @@ export default function Taktikboard() {
   const [formation, setFormation] = useState(formations["4-4-2 Flach"]);
   const [tacticLevel, setTacticLevel] = useState(1);
   const [players, setPlayers] = useState([]);
-  const [teamData, setTeamData] = useState(null);
   const [fieldPlayers, setFieldPlayers] = useState({});
   const [selectingPos, setSelectingPos] = useState(null);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    console.log("Aktueller User:", user);
-  }, [user]);
-  
-  // --- Fetch team & players ---
+  // Fetch team, players & saved formation/tactic
   useEffect(() => {
     const fetchData = async () => {
       if (!user?.teamId) return;
       setLoading(true);
-      // Fetch Team
-      const teamDoc = await getDocs(query(collection(db, "teams"), where("id", "==", user.teamId)));
-      const team = teamDoc.docs.length > 0 ? { id: teamDoc.docs[0].id, ...teamDoc.docs[0].data() } : null;
-      setTeamData(team);
-      // Fetch Players
-      const playerSnap = await getDocs(query(collection(db, "players"), where("teamId", "==", user.teamId)));
-      setPlayers(playerSnap.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+      // Team data
+      const teamRef = doc(db, 'teams', user.teamId);
+      const teamSnap = await getDoc(teamRef);
+      const teamData = teamSnap.exists() ? teamSnap.data() : null;
+      // Players
+      const playerSnap = await getDocs(
+        query(collection(db, "players"), where("teamId", "==", user.teamId))
+      );
+      setPlayers(playerSnap.docs.map(d => ({ id: d.id, ...d.data() })));
+      // Saved formation
+      if (teamData?.formation) {
+        const fp = {};
+        teamData.formation.forEach(f => {
+          if (f.positionKey) fp[f.positionKey] = f.playerId;
+        });
+        setFieldPlayers(fp);
+      }
+      // Saved tactic
+      if (typeof teamData?.tacticLevel === 'number') {
+        setTacticLevel(teamData.tacticLevel);
+      }
       setLoading(false);
     };
     fetchData();
   }, [user]);
 
-  // --- Formation wechseln
+  // Update formation structure on change
   useEffect(() => {
     setFormation(formations[formationKey]);
-    // Reset Auswahl auf neue Formation
     setFieldPlayers({});
   }, [formationKey]);
 
-  // --- Handle Player Selection ---
   const handleSelectPlayer = (posKey, playerId) => {
-    setFieldPlayers(prev => ({
-      ...prev,
-      [posKey]: playerId
-    }));
+    setFieldPlayers(prev => ({ ...prev, [posKey]: playerId }));
     setSelectingPos(null);
   };
 
-  // --- Spieler für das aktuelle Feld filtern (Positionsgruppe)
   const getEligiblePlayers = (posKey) => {
-    const group = positionGroupMapping[posKey.replace(/[0-9]/g, "")] || "";
-    // bereits gesetzte Spieler ausblenden:
-    const usedPlayerIds = Object.values(fieldPlayers).filter(id => !!id);
-    return players.filter(
-      p => p.positionGroup === group && !usedPlayerIds.includes(p.id)
-    );
+    const group = positionGroupMapping[posKey.replace(/[0-9]/g, "")];
+    const usedIds = Object.values(fieldPlayers);
+    return players.filter(p => p.positionGroup === group && !usedIds.includes(p.id));
   };
 
-  // --- Spieler-Objekt für Feldposition holen
-  const getPlayerForPos = (posKey) => {
-    const pid = fieldPlayers[posKey];
-    return players.find(p => p.id === pid);
-  };
+  const getPlayerForPos = (posKey) => players.find(p => p.id === fieldPlayers[posKey]);
 
-  // --- Speichern in Firestore
   const handleSave = async () => {
     if (!user?.teamId) return;
-    const formationData = formation.map(f => ({
-      positionKey: f.pos,
-      playerId: fieldPlayers[f.pos] || null
-    }));
-    try {
-      await updateDoc(doc(db, "teams", user.teamId), {
-        formation: formationData,
-        tacticLevel
-      });
-      alert("Taktik und Aufstellung gespeichert!");
-    } catch (e) {
-      alert("Fehler beim Speichern.");
-    }
+    const formationData = Object.entries(fieldPlayers).map(([positionKey, playerId]) => ({ positionKey, playerId }));
+    await updateDoc(doc(db, 'teams', user.teamId), {
+      formation: formationData,
+      tacticLevel
+    });
+    alert("Aufstellung & Taktik gespeichert!");
   };
 
   if (loading) return <Typography>Lade...</Typography>;
 
   return (
     <Box sx={{
-      display: 'flex',
-      justifyContent: 'center',
-      alignItems: 'flex-start',
-      minHeight: '80vh',
-      gap: 4,
-      mt: 5
+      display: 'flex', justifyContent: 'center', alignItems: 'flex-start',
+      minHeight: '80vh', gap: 4, mt: 5
     }}>
       {/* Taktik Panel */}
-      <Paper elevation={6} sx={{
-        p: 4,
-        minWidth: 350,
-        bgcolor: "#212933",
-        color: "#fff",
-        borderRadius: 4
-      }}>
-        <Typography variant="h4" sx={{ mb: 3, color: "#fff", fontWeight: 700 }}>Formation</Typography>
-        <Typography variant="body2" sx={{ color: "#ffc447", mb: 1 }}>Formation</Typography>
+      <Paper elevation={6} sx={{ p: 4, minWidth: 350, bgcolor: "#212933", color: "#fff", borderRadius: 4 }}>
+        <Typography variant="h4" sx={{ mb: 3, fontWeight: 700 }}>Formation</Typography>
+        <Typography variant="body2" sx={{ color: "#ffc447", mb: 1 }}>Formation wählen</Typography>
         <Select
           fullWidth
           value={formationKey}
@@ -246,47 +222,33 @@ export default function Taktikboard() {
           fullWidth
           variant="contained"
           color="warning"
-          sx={{ fontWeight: 700, py: 1.5, fontSize: 18, mt: 2, letterSpacing: 1 }}
+          sx={{ fontWeight: 700, py: 1.5, fontSize: 18, mt: 2 }}
           onClick={handleSave}
         >
           SPEICHERN
         </Button>
       </Paper>
 
-      {/* Spielfeld */}
+      {/* Spielfeld - Field Container */}
       <Box sx={{
-        position: "relative",
-        width: 600,
-        height: 800,
-        bgcolor: "transparent",
-        borderRadius: 6,
-        overflow: "hidden",
-        background: "#116820",
+        position: "relative", width: 600, height: 800,
+        bgcolor: "#116820", borderRadius: 6, overflow: "hidden",
         boxShadow: "0 0 32px #111d"
       }}>
-        {/* Linien */}
+        {/* Bounding Box */}
         <Box sx={{
-          position: "absolute",
-          left: "5%",
-          top: "4%",
-          width: "90%",
-          height: "92%",
-          border: "4px solid #a4ffa4",
-          borderRadius: "32px",
-          zIndex: 0
+          position: "absolute", left: "5%", top: "4%",
+          width: "90%", height: "92%",
+          border: "4px solid #a4ffa4", borderRadius: "32px"
         }}/>
-        {/* Mittelkreis */}
+        {/* Center Circle */}
         <Box sx={{
-          position: "absolute",
-          top: "37%",
-          left: "35%",
-          width: "30%",
-          height: "11%",
-          border: "4px solid #a4ffa4",
-          borderRadius: "50%",
-          zIndex: 1
+          position: "absolute", top: "37%", left: "35%",
+          width: "30%", height: "11%",
+          border: "4px solid #a4ffa4", borderRadius: "50%"
         }}/>
-        {/* Spieler */}
+
+        {/* Players on Field */}
         {formation.map(f => {
           const pObj = getPlayerForPos(f.pos);
           return (
@@ -297,39 +259,35 @@ export default function Taktikboard() {
                   position: "absolute",
                   left: `calc(${f.x}% - 36px)`,
                   top: `calc(${f.y}% - 36px)`,
-                  width: 72,
-                  height: 72,
+                  width: 72, height: 72,
                   bgcolor: pObj ? "#32436e" : "#eee",
                   color: pObj ? "#fff" : "#465674",
-                  display: "flex",
-                  flexDirection: "column",
-                  alignItems: "center",
-                  justifyContent: "center",
+                  display: "flex", flexDirection: "column",
+                  alignItems: "center", justifyContent: "center",
                   borderRadius: 2.5,
                   border: pObj ? "3px solid #ffc447" : "2px solid #b7c0cd",
-                  fontWeight: 700,
-                  fontSize: 18,
+                  fontWeight: 700, fontSize: 18,
                   cursor: "pointer",
                   boxShadow: pObj ? "0 0 12px #ffc44788" : "none",
                   transition: "all 0.13s",
                   zIndex: 3,
-                  "&:hover": {
-                    bgcolor: "#4854ab",
-                    color: "#ffc447"
-                  }
+                  '&:hover': { bgcolor: '#4854ab', color: '#ffc447' }
                 }}
               >
-                <span style={{
-                  fontSize: 15,
-                  fontWeight: 800,
-                  letterSpacing: 1,
-                  marginBottom: 2
-                }}>{f.pos}</span>
+                <span style={{ fontSize: 15, fontWeight: 800, letterSpacing: 1, marginBottom: 2 }}>
+                  {f.pos}
+                </span>
                 {pObj ? (
                   <>
-                    <span style={{ fontSize: 17, fontWeight: 700, lineHeight: 1 }}>{pObj.vorname}</span>
-                    <span style={{ fontSize: 13, opacity: 0.7 }}>{pObj.nachname}</span>
-                    <span style={{ fontSize: 22 }}>{flagEmoji(pObj.nationalitaet)}</span>
+                    <span style={{ fontSize: 17, fontWeight: 700, lineHeight: 1 }}>
+                      {pObj.vorname}
+                    </span>
+                    <span style={{ fontSize: 13, opacity: 0.7 }}>
+                      {pObj.nachname}
+                    </span>
+                    <span style={{ fontSize: 22 }}>
+                      {flagEmoji(pObj.nationalitaet)}
+                    </span>
                   </>
                 ) : (
                   <span style={{ fontSize: 36, opacity: 0.3, fontWeight: 900 }}>+</span>
@@ -340,7 +298,7 @@ export default function Taktikboard() {
         })}
       </Box>
 
-      {/* Spieler-Auswahl-Modal */}
+      {/* Spieler-Auswahl-Dialog */}
       <Dialog open={!!selectingPos} onClose={() => setSelectingPos(null)} maxWidth="xs" fullWidth>
         <DialogTitle sx={{ bgcolor: "#27344b", color: "#ffc447", fontWeight: 800 }}>
           Spieler auswählen ({selectingPos})
@@ -353,28 +311,25 @@ export default function Taktikboard() {
             {selectingPos && getEligiblePlayers(selectingPos.replace(/[0-9]/g, "")).map(p => (
               <ListItem button key={p.id} onClick={() => handleSelectPlayer(selectingPos, p.id)}>
                 <ListItemAvatar>
-                  <Avatar src={p.avatarUrl} sx={{ bgcolor: "#3c4e5e" }}>{p.vorname?.[0] || "?"}</Avatar>
+                  <Avatar src={p.avatarUrl} sx={{ bgcolor: "#3c4e5e" }}>
+                    {p.vorname?.[0] || "?"}
+                  </Avatar>
                 </ListItemAvatar>
                 <ListItemText
-                  primary={
-                    <span style={{ fontWeight: 600, color: "#ffc447" }}>
-                      {p.vorname} {p.nachname}
-                      {" "}
-                      <span style={{ fontSize: 19 }}>{flagEmoji(p.nationalitaet)}</span>
-                    </span>
-                  }
-                  secondary={
-                    <span style={{ color: "#fff" }}>
-                      {p.position} | Stärke: {p.staerke}
-                    </span>
-                  }
+                  primary={<span style={{ fontWeight: 600, color: "#ffc447" }}>
+                    {p.vorname} {p.nachname} {' '}
+                    <span style={{ fontSize: 19 }}>{flagEmoji(p.nationalitaet)}</span>
+                  </span>}
+                  secondary={<span style={{ color: "#fff" }}>{p.position} | Stärke: {p.staerke}</span>}
                 />
               </ListItem>
             ))}
           </List>
         </DialogContent>
         <DialogActions sx={{ bgcolor: "#27344b" }}>
-          <Button onClick={() => setSelectingPos(null)} color="warning" variant="text" sx={{ fontWeight: 700 }}>ABBRECHEN</Button>
+          <Button onClick={() => setSelectingPos(null)} color="warning" variant="text" sx={{ fontWeight: 700 }}>
+            ABBRECHEN
+          </Button>
         </DialogActions>
       </Dialog>
     </Box>

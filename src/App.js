@@ -25,6 +25,8 @@ import ChallengePage from './pages/ChallengePage';
 import MatchHistoryPage from './pages/MatchHistoryPage';
 import MatchResultPage from './pages/MatchResultPage';
 import PendingActionsPage from './pages/PendingActionsPage';
+import PlayerDetailPage from './pages/PlayerDetailPage';
+
 
 function App() {
   return (
@@ -68,6 +70,7 @@ function AppContent() {
               <Route path="/login" element={<Navigate to="/" replace />} />
               <Route path="*" element={<Navigate to="/" replace />} />
               <Route path="/pending" element={<PendingActionsPage />} />
+              <Route path="/players/:playerId" element={<PlayerDetailPage />} />
             </>
           ) : (
             <>

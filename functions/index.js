@@ -1,4 +1,4 @@
-// index.js
+// functions/index.js
 const { onDocumentUpdated } = require("firebase-functions/v2/firestore");
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
@@ -13,13 +13,54 @@ initializeApp({ projectId: "deadlineday-sim" });
 const db = getFirestore();
 const auth = getAuth();
 
+// --- HILFSFUNKTION: Spielerbewertungen berechnen ---
+function calculateRatingsFromEvents(events, homePlayers, awayPlayers) {
+  const ratings = {};
+  // Initialnote 6.0 für alle teilnehmenden Spieler
+  [...homePlayers, ...awayPlayers].forEach((player) => {
+    ratings[player.id] = 6.0;
+  });
+
+  // Durch alle Ereignisse iterieren
+  events.forEach((ev) => {
+    const pid = ev.playerId;
+    if (!pid || ratings[pid] === undefined) return;
+    switch (ev.type) {
+      case 'goal':
+        ratings[pid] -= 1.0;
+        break;
+      case 'assist':
+        ratings[pid] -= 0.7;
+        break;
+      case 'pass':
+        ratings[pid] += ev.success ? -0.05 : +0.2;
+        break;
+      case 'duel':
+        ratings[pid] += ev.success ? -0.1 : +0.2;
+        break;
+      case 'foul':
+        ratings[pid] += 0.5;
+        break;
+      default:
+        break;
+    }
+  });
+
+  // Auf Bereich [1.0, 10.0] beschränken und auf 1 Dezimalstelle runden
+  Object.keys(ratings).forEach((pid) => {
+    ratings[pid] = Math.min(10.0, Math.max(1.0, Number(ratings[pid].toFixed(1))));
+  });
+
+  return ratings;
+}
+
 // --- SPIEL-SIMULATION (NEU, MODULAR) ---
 exports.startSimulation = onDocumentUpdated(
   {
     document: "games/{gameId}",
     region: "europe-west3",
     memory: "512MiB",
-    timeoutSeconds: 600, // 10 Minuten
+    timeoutSeconds: 600,
   },
   async (event) => {
     const dataBefore = event.data.before.data();
@@ -53,21 +94,23 @@ exports.startSimulation = onDocumentUpdated(
           minute: 0,
           events: [],
           score: { home: 0, away: 0 },
-          // weitere Felder nach Bedarf
         };
 
-        const totalTicks = 120;      // 120 Aktionen
+        const totalTicks = 120;
         let currentTick = 0;
         const tickInterval = setInterval(async () => {
           try {
             currentTick++;
-            // Nächsten Spielstand und Event berechnen
-            gameState = getNextGameState(gameState, teamHomeData, teamAwayData, allHomePlayers, allAwayPlayers);
+            gameState = getNextGameState(
+              gameState,
+              teamHomeData,
+              teamAwayData,
+              allHomePlayers,
+              allAwayPlayers
+            );
 
-            // Neuestes Event extrahieren (immer das letzte)
             const latestEvent = gameState.events[gameState.events.length - 1];
 
-            // In Firestore speichern
             await gameRef.update({
               liveTickerEvents: FieldValue.arrayUnion(latestEvent),
               minute: gameState.minute,
@@ -75,10 +118,18 @@ exports.startSimulation = onDocumentUpdated(
               scoreAway: gameState.score.away,
             });
 
-            // Beenden, wenn alle Ticks erledigt oder 90 Minuten erreicht
             if (currentTick >= totalTicks || gameState.minute >= 90) {
               clearInterval(tickInterval);
-              await gameRef.update({ status: "finished" });
+              // Spielerbewertungen berechnen und speichern
+              const ratings = calculateRatingsFromEvents(
+                gameState.events,
+                allHomePlayers,
+                allAwayPlayers
+              );
+              await gameRef.update({
+                status: "finished",
+                playerRatings: ratings,
+              });
               logger.info(`✅ Simulation für Spiel ${gameId} beendet.`);
             }
           } catch (err) {
@@ -89,7 +140,7 @@ exports.startSimulation = onDocumentUpdated(
               liveTickerEvents: FieldValue.arrayUnion({ text: `Simulationsfehler: ${err.message}` }),
             });
           }
-        }, 5000); // alle 5 Sekunden
+        }, 5000);
       } catch (error) {
         logger.error(`Fehler in Simulation ${gameId}:`, error);
         await db.collection("games").doc(gameId).update({
@@ -121,6 +172,8 @@ exports.acceptGameInvite = onCall(
       scheduledStartTime: inviteData.proposedDate,
       status: 'scheduled',
       type: 'FS',
+      competitionCategory: 'FS',
+      competitionCode: null,
       scoreHome: 0,
       scoreAway: 0,
       liveTickerEvents: []
@@ -131,42 +184,52 @@ exports.acceptGameInvite = onCall(
 );
 
 // --- SPIEL-AUTO-STARTER ---
-exports.checkScheduledGames = onSchedule("every 1 minutes", async (event) => {
-  logger.info("Suche nach zu startenden Spielen...");
-  const now = new Date();
-  const q = db.collection("games").where("status", "==", "scheduled").where("scheduledStartTime", "<=", now);
-  const snapshot = await q.get();
+exports.checkScheduledGames = onSchedule(
+  { region: "europe-west3", schedule: "every 1 minutes" },
+  async (event) => {
+    logger.info("Suche nach zu startenden Spielen...");
+    const now = new Date();
+    const q = db.collection("games")
+      .where("status", "==", "scheduled")
+      .where("scheduledStartTime", "<=", now);
+    const snapshot = await q.get();
 
-  if (snapshot.empty) {
-    logger.info("Keine Spiele zum Starten gefunden.");
+    if (snapshot.empty) {
+      logger.info("Keine Spiele zum Starten gefunden.");
+      return null;
+    }
+
+    const batch = db.batch();
+    snapshot.docs.forEach((doc) => {
+      logger.info(`Starte Spiel ${doc.id}...`);
+      batch.update(doc.ref, { status: 'live' });
+    });
+
+    await batch.commit();
     return null;
   }
-
-  const batch = db.batch();
-  snapshot.docs.forEach(doc => {
-    logger.info(`Starte Spiel ${doc.id}...`);
-    batch.update(doc.ref, { status: 'live' });
-  });
-
-  await batch.commit();
-  return null;
-});
+);
 
 // --- CLEANUP INVITES ---
-exports.cleanupOldInvites = onSchedule("every 1 hours", async (event) => {
-  const twelveHoursAgo = new Date(Date.now() - 12 * 60 * 60 * 1000);
-  const q = db.collection('game_invites').where("status", "==", "pending").where("createdAt", "<=", twelveHoursAgo);
-  const snapshot = await q.get();
-  if (snapshot.empty) return null;
+exports.cleanupOldInvites = onSchedule(
+  { region: "europe-west3", schedule: "every 1 hours" },
+  async (event) => {
+    const twelveHoursAgo = new Date(Date.now() - 12 * 60 * 60 * 1000);
+    const q = db.collection('game_invites')
+      .where("status", "==", "pending")
+      .where("createdAt", "<=", twelveHoursAgo);
+    const snapshot = await q.get();
+    if (snapshot.empty) return null;
 
-  const batch = db.batch();
-  snapshot.docs.forEach(doc => {
-    logger.info(`Lösche abgelaufene Einladung: ${doc.id}`);
-    batch.delete(doc.ref);
-  });
-  await batch.commit();
-  return null;
-});
+    const batch = db.batch();
+    snapshot.docs.forEach((doc) => {
+      logger.info(`Lösche abgelaufene Einladung: ${doc.id}`);
+      batch.delete(doc.ref);
+    });
+    await batch.commit();
+    return null;
+  }
+);
 
 // --- ADMIN ROLE ---
 exports.addAdminRole = onCall({ region: "europe-west3" }, async (request) => {
@@ -206,7 +269,6 @@ exports.executeTransfer = onCall({ region: "europe-west3" }, async (request) => 
     });
 
     batch.update(transferRef, { status: 'completed' });
-
     await batch.commit();
     logger.info(`Transfer ${transferId} erfolgreich ausgeführt.`);
     return { message: "Transfer erfolgreich!" };

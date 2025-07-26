@@ -632,7 +632,7 @@ function getNextGameState(state,homeTeam,awayTeam,rawHome,rawAway,lineupHome=nul
     justWonDuel:state.justWonDuel,
     attackTicks:(nextPoss===state.possession && nextZone.endsWith("Attack"))?(state.attackTicks||0)+1:0,
     playerRatings,
-    ratingEventsBufferI
+    ratingEventsBuffer
   };
 }
 
