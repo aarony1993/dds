@@ -20,41 +20,35 @@ import {
 } from "@mui/material";
 import { useAuth } from "../context/AuthContext";
 import { db } from "../firebase/config";
-import { collection, query, where, getDocs, doc, getDoc, updateDoc } from "firebase/firestore";
+import {
+  collection,
+  query,
+  where,
+  getDocs,
+  doc,
+  getDoc,
+  updateDoc
+} from "firebase/firestore";
 
 // --- Mapping Feldposition => Positionsgruppe
-// --- Mapping Feldposition => Positionsgruppe nach deinem Seed
 const positionGroupMapping = {
-  "TW": "TOR",
-  "IV": "DEF",
-  "LV": "DEF",
-  "RV": "DEF",
-  "ZDM": "MID",
-  "ZM": "MID",
-  "LM": "MID",
-  "RM": "MID",
-  "ZOM": "MID",
-  "HS": "ATT",
-  "ST": "ATT",
-  "MS": "ATT",
-  "LA": "ATT",
-  "RA": "ATT"
+  TW: "TOR",
+  IV: "DEF",
+  LV: "DEF",
+  RV: "DEF",
+  ZDM: "MID",
+  ZM: "MID",
+  LM: "MID",
+  RM: "MID",
+  ZOM: "MID",
+  HS: "ATT",
+  ST: "ATT",
+  MS: "ATT",
+  LA: "ATT",
+  RA: "ATT"
 };
 
-// --- Flaggen Mapping
-const flagEmoji = (country) => {
-  const flags = {
-    "Deutschland": "🇩🇪",
-    "Italien": "🇮🇹",
-    "Frankreich": "🇫🇷",
-    "England": "🇬🇧",
-    "Spanien": "🇪🇸",
-    "Portugal": "🇵🇹",
-  };
-  return flags[country] || "🏳️";
-};
-
-// --- Formationen: Feldpositionen mit exakten Koordinaten (% des Spielfelds) ---
+// --- Formationen: Feldpositionen mit exakten Koordinaten (% des Spielfelds)
 const formations = {
   "4-4-2 Flach": [
     { pos: "TW", x: 50, y: 96 },
@@ -110,7 +104,7 @@ const formations = {
   ]
 };
 
-// --- Slider Labels ---
+// --- Slider für Taktik-Level ---
 const tacticSliderMarks = [
   { value: 0, label: "Defensiv" },
   { value: 1, label: "Ausbalanciert" },
@@ -120,28 +114,27 @@ const tacticSliderMarks = [
 export default function Taktikboard() {
   const { user } = useAuth();
   const [formationKey, setFormationKey] = useState("4-4-2 Flach");
-  const [formation, setFormation] = useState(formations["4-4-2 Flach"]);
+  const [formation, setFormation] = useState(formations[formationKey]);
   const [tacticLevel, setTacticLevel] = useState(1);
   const [players, setPlayers] = useState([]);
   const [fieldPlayers, setFieldPlayers] = useState({});
   const [selectingPos, setSelectingPos] = useState(null);
   const [loading, setLoading] = useState(true);
 
-  // Fetch team, players & saved formation/tactic
+  // Daten laden: Team, Spieler, Formation, Taktik
   useEffect(() => {
     const fetchData = async () => {
       if (!user?.teamId) return;
       setLoading(true);
-      // Team data
       const teamRef = doc(db, 'teams', user.teamId);
       const teamSnap = await getDoc(teamRef);
       const teamData = teamSnap.exists() ? teamSnap.data() : null;
-      // Players
+
       const playerSnap = await getDocs(
         query(collection(db, "players"), where("teamId", "==", user.teamId))
       );
       setPlayers(playerSnap.docs.map(d => ({ id: d.id, ...d.data() })));
-      // Saved formation
+
       if (teamData?.formation) {
         const fp = {};
         teamData.formation.forEach(f => {
@@ -149,16 +142,17 @@ export default function Taktikboard() {
         });
         setFieldPlayers(fp);
       }
-      // Saved tactic
+
       if (typeof teamData?.tacticLevel === 'number') {
         setTacticLevel(teamData.tacticLevel);
       }
+
       setLoading(false);
     };
     fetchData();
   }, [user]);
 
-  // Update formation structure on change
+  // Formation wechseln
   useEffect(() => {
     setFormation(formations[formationKey]);
     setFieldPlayers({});
@@ -190,11 +184,8 @@ export default function Taktikboard() {
   if (loading) return <Typography>Lade...</Typography>;
 
   return (
-    <Box sx={{
-      display: 'flex', justifyContent: 'center', alignItems: 'flex-start',
-      minHeight: '80vh', gap: 4, mt: 5
-    }}>
-      {/* Taktik Panel */}
+    <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'flex-start', minHeight: '80vh', gap: 4, mt: 5 }}>
+      {/* Taktik-Panel */}
       <Paper elevation={6} sx={{ p: 4, minWidth: 350, bgcolor: "#212933", color: "#fff", borderRadius: 4 }}>
         <Typography variant="h4" sx={{ mb: 3, fontWeight: 700 }}>Formation</Typography>
         <Typography variant="body2" sx={{ color: "#ffc447", mb: 1 }}>Formation wählen</Typography>
@@ -228,69 +219,115 @@ export default function Taktikboard() {
           SPEICHERN
         </Button>
       </Paper>
-
-      {/* Spielfeld - Field Container */}
-      <Box sx={{
-        position: "relative", width: 600, height: 800,
-        bgcolor: "#116820", borderRadius: 6, overflow: "hidden",
-        boxShadow: "0 0 32px #111d"
-      }}>
+      {/* Spielfeld */}
+      <Box
+        sx={{
+          position: "relative",
+          width: 600,
+          height: 800,
+          bgcolor: "#116820",
+          borderRadius: 6,
+          overflow: "hidden",
+          boxShadow: "0 0 32px #111d"
+        }}
+      >
         {/* Bounding Box */}
-        <Box sx={{
-          position: "absolute", left: "5%", top: "4%",
-          width: "90%", height: "92%",
-          border: "4px solid #a4ffa4", borderRadius: "32px"
-        }}/>
+        <Box
+          sx={{
+            position: "absolute",
+            left: "5%",
+            top: "4%",
+            width: "90%",
+            height: "92%",
+            border: "4px solid #a4ffa4",
+            borderRadius: "32px"
+          }}
+        />
         {/* Center Circle */}
-        <Box sx={{
-          position: "absolute", top: "37%", left: "35%",
-          width: "30%", height: "11%",
-          border: "4px solid #a4ffa4", borderRadius: "50%"
-        }}/>
+        <Box
+          sx={{
+            position: "absolute",
+            top: "37%",
+            left: "35%",
+            width: "30%",
+            height: "11%",
+            border: "4px solid #a4ffa4",
+            borderRadius: "50%"
+          }}
+        />
 
-        {/* Players on Field */}
-        {formation.map(f => {
+        {/* Spieler auf dem Spielfeld */}
+        {formation.map((f) => {
           const pObj = getPlayerForPos(f.pos);
           return (
-            <Tooltip key={f.pos} title={pObj ? `${pObj.vorname} ${pObj.nachname} (${pObj.position})` : `Position: ${f.pos}`}>
+            <Tooltip
+              key={f.pos}
+              title={
+                pObj
+                  ? `${pObj.vorname} ${pObj.nachname} (${pObj.positionGroup})`
+                  : `Position: ${f.pos}`
+              }
+            >
               <Box
                 onClick={() => setSelectingPos(f.pos)}
                 sx={{
                   position: "absolute",
                   left: `calc(${f.x}% - 36px)`,
                   top: `calc(${f.y}% - 36px)`,
-                  width: 72, height: 72,
+                  width: 72,
+                  height: 72,
                   bgcolor: pObj ? "#32436e" : "#eee",
                   color: pObj ? "#fff" : "#465674",
-                  display: "flex", flexDirection: "column",
-                  alignItems: "center", justifyContent: "center",
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                  justifyContent: "center",
                   borderRadius: 2.5,
                   border: pObj ? "3px solid #ffc447" : "2px solid #b7c0cd",
-                  fontWeight: 700, fontSize: 18,
+                  fontWeight: 700,
+                  fontSize: 18,
                   cursor: "pointer",
                   boxShadow: pObj ? "0 0 12px #ffc44788" : "none",
                   transition: "all 0.13s",
                   zIndex: 3,
-                  '&:hover': { bgcolor: '#4854ab', color: '#ffc447' }
+                  "&:hover": { bgcolor: "#4854ab", color: "#ffc447" }
                 }}
               >
-                <span style={{ fontSize: 15, fontWeight: 800, letterSpacing: 1, marginBottom: 2 }}>
+                <span
+                  style={{
+                    fontSize: 15,
+                    fontWeight: 800,
+                    letterSpacing: 1,
+                    marginBottom: 2
+                  }}
+                >
                   {f.pos}
                 </span>
                 {pObj ? (
                   <>
-                    <span style={{ fontSize: 17, fontWeight: 700, lineHeight: 1 }}>
+                    <span
+                      style={{
+                        fontSize: 17,
+                        fontWeight: 700,
+                        lineHeight: 1
+                      }}
+                    >
                       {pObj.vorname}
                     </span>
                     <span style={{ fontSize: 13, opacity: 0.7 }}>
                       {pObj.nachname}
                     </span>
-                    <span style={{ fontSize: 22 }}>
-                      {flagEmoji(pObj.nationalitaet)}
-                    </span>
                   </>
                 ) : (
-                  <span style={{ fontSize: 36, opacity: 0.3, fontWeight: 900 }}>+</span>
+                  <span
+                    style={{
+                      fontSize: 36,
+                      opacity: 0.3,
+                      fontWeight: 900
+                    }}
+                  >
+                    +
+                  </span>
                 )}
               </Box>
             </Tooltip>
@@ -299,35 +336,66 @@ export default function Taktikboard() {
       </Box>
 
       {/* Spieler-Auswahl-Dialog */}
-      <Dialog open={!!selectingPos} onClose={() => setSelectingPos(null)} maxWidth="xs" fullWidth>
-        <DialogTitle sx={{ bgcolor: "#27344b", color: "#ffc447", fontWeight: 800 }}>
+      <Dialog
+        open={!!selectingPos}
+        onClose={() => setSelectingPos(null)}
+        maxWidth="xs"
+        fullWidth
+      >
+        <DialogTitle
+          sx={{ bgcolor: "#27344b", color: "#ffc447", fontWeight: 800 }}
+        >
           Spieler auswählen ({selectingPos})
         </DialogTitle>
         <DialogContent sx={{ bgcolor: "#202c3b", minHeight: 340 }}>
           <List>
-            {selectingPos && getEligiblePlayers(selectingPos.replace(/[0-9]/g, "")).length === 0 && (
-              <Typography sx={{ color: "#fff" }}>Keine passenden Spieler verfügbar.</Typography>
-            )}
-            {selectingPos && getEligiblePlayers(selectingPos.replace(/[0-9]/g, "")).map(p => (
-              <ListItem button key={p.id} onClick={() => handleSelectPlayer(selectingPos, p.id)}>
-                <ListItemAvatar>
-                  <Avatar src={p.avatarUrl} sx={{ bgcolor: "#3c4e5e" }}>
-                    {p.vorname?.[0] || "?"}
-                  </Avatar>
-                </ListItemAvatar>
-                <ListItemText
-                  primary={<span style={{ fontWeight: 600, color: "#ffc447" }}>
-                    {p.vorname} {p.nachname} {' '}
-                    <span style={{ fontSize: 19 }}>{flagEmoji(p.nationalitaet)}</span>
-                  </span>}
-                  secondary={<span style={{ color: "#fff" }}>{p.position} | Stärke: {p.staerke}</span>}
-                />
-              </ListItem>
-            ))}
+            {selectingPos &&
+              getEligiblePlayers(selectingPos.replace(/[0-9]/g, "")).length ===
+                0 && (
+                <Typography sx={{ color: "#fff" }}>
+                  Keine passenden Spieler verfügbar.
+                </Typography>
+              )}
+            {selectingPos &&
+              getEligiblePlayers(selectingPos.replace(/[0-9]/g, "")).map(
+                (p) => (
+                  <ListItem
+                    button
+                    key={p.id}
+                    onClick={() => handleSelectPlayer(selectingPos, p.id)}
+                  >
+                    <ListItemAvatar>
+                      <Avatar
+                        src={p.avatarUrl || "/dummy-player.png"}
+                        sx={{ bgcolor: "#3c4e5e" }}
+                      >
+                        {p.vorname?.[0] || "?"}
+                      </Avatar>
+                    </ListItemAvatar>
+                    <ListItemText
+                      primary={
+                        <span style={{ fontWeight: 600, color: "#ffc447" }}>
+                          {p.vorname} {p.nachname}
+                        </span>
+                      }
+                      secondary={
+                        <span style={{ color: "#fff" }}>
+                          {p.positionGroup}
+                        </span>
+                      }
+                    />
+                  </ListItem>
+                )
+              )}
           </List>
         </DialogContent>
         <DialogActions sx={{ bgcolor: "#27344b" }}>
-          <Button onClick={() => setSelectingPos(null)} color="warning" variant="text" sx={{ fontWeight: 700 }}>
+          <Button
+            onClick={() => setSelectingPos(null)}
+            color="warning"
+            variant="text"
+            sx={{ fontWeight: 700 }}
+          >
             ABBRECHEN
           </Button>
         </DialogActions>

@@ -16,45 +16,28 @@ const auth = getAuth();
 // --- HILFSFUNKTION: Spielerbewertungen berechnen ---
 function calculateRatingsFromEvents(events, homePlayers, awayPlayers) {
   const ratings = {};
-  // Initialnote 6.0 für alle teilnehmenden Spieler
   [...homePlayers, ...awayPlayers].forEach((player) => {
     ratings[player.id] = 6.0;
   });
-
-  // Durch alle Ereignisse iterieren
   events.forEach((ev) => {
     const pid = ev.playerId;
     if (!pid || ratings[pid] === undefined) return;
     switch (ev.type) {
-      case 'goal':
-        ratings[pid] -= 1.0;
-        break;
-      case 'assist':
-        ratings[pid] -= 0.7;
-        break;
-      case 'pass':
-        ratings[pid] += ev.success ? -0.05 : +0.2;
-        break;
-      case 'duel':
-        ratings[pid] += ev.success ? -0.1 : +0.2;
-        break;
-      case 'foul':
-        ratings[pid] += 0.5;
-        break;
-      default:
-        break;
+      case 'goal':    ratings[pid] -= 1.0; break;
+      case 'assist':  ratings[pid] -= 0.7; break;
+      case 'pass':    ratings[pid] += ev.success ? -0.05 : +0.2; break;
+      case 'duel':    ratings[pid] += ev.success ? -0.1  : +0.2; break;
+      case 'foul':    ratings[pid] += 0.5; break;
+      default: break;
     }
   });
-
-  // Auf Bereich [1.0, 10.0] beschränken und auf 1 Dezimalstelle runden
   Object.keys(ratings).forEach((pid) => {
     ratings[pid] = Math.min(10.0, Math.max(1.0, Number(ratings[pid].toFixed(1))));
   });
-
   return ratings;
 }
 
-// --- SPIEL-SIMULATION (NEU, MODULAR) ---
+// --- SPIEL-SIMULATION ---
 exports.startSimulation = onDocumentUpdated(
   {
     document: "games/{gameId}",
@@ -63,89 +46,59 @@ exports.startSimulation = onDocumentUpdated(
     timeoutSeconds: 600,
   },
   async (event) => {
-    const dataBefore = event.data.before.data();
-    const dataAfter = event.data.after.data();
-
-    // Nur bei Statuswechsel von scheduled zu live starten
-    if (dataBefore.status === "scheduled" && dataAfter.status === "live") {
+    const before = event.data.before.data();
+    const after  = event.data.after.data();
+    if (before.status === "scheduled" && after.status === "live") {
       const gameId = event.params.gameId;
       const gameRef = db.collection("games").doc(gameId);
       logger.info(`✅ Simulation für Spiel ${gameId} gestartet!`);
-
       try {
-        // Teams und Spieler laden
         const [teamHomeDoc, teamAwayDoc] = await Promise.all([
-          db.collection("teams").doc(dataAfter.teamHomeId).get(),
-          db.collection("teams").doc(dataAfter.teamAwayId).get(),
+          db.collection("teams").doc(after.teamHomeId).get(),
+          db.collection("teams").doc(after.teamAwayId).get(),
         ]);
-        if (!teamHomeDoc.exists || !teamAwayDoc.exists) throw new Error(`Team nicht gefunden.`);
-        const teamHomeData = { id: teamHomeDoc.id, ...teamHomeDoc.data() };
-        const teamAwayData = { id: teamAwayDoc.id, ...teamAwayDoc.data() };
-
-        const [homePlayersSnap, awayPlayersSnap] = await Promise.all([
-          db.collection("players").where("teamId", "==", teamHomeData.id).get(),
-          db.collection("players").where("teamId", "==", teamAwayData.id).get(),
+        const teamHome = { id: teamHomeDoc.id, ...teamHomeDoc.data() };
+        const teamAway = { id: teamAwayDoc.id, ...teamAwayDoc.data() };
+        const [homeSnap, awaySnap] = await Promise.all([
+          db.collection("players").where("teamId", "==", teamHome.id).get(),
+          db.collection("players").where("teamId", "==", teamAway.id).get(),
         ]);
-        const allHomePlayers = homePlayersSnap.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
-        const allAwayPlayers = awayPlayersSnap.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
-
-        // Initialen Spielstand anlegen
-        let gameState = {
-          minute: 0,
-          events: [],
-          score: { home: 0, away: 0 },
-        };
-
+        const homePlayers = homeSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+        const awayPlayers = awaySnap.docs.map(d => ({ id: d.id, ...d.data() }));
+        let gameState = { minute: 0, events: [], score: { home: 0, away: 0 } };
+        let tick = 0;
         const totalTicks = 120;
-        let currentTick = 0;
-        const tickInterval = setInterval(async () => {
+        const interval = setInterval(async () => {
           try {
-            currentTick++;
-            gameState = getNextGameState(
-              gameState,
-              teamHomeData,
-              teamAwayData,
-              allHomePlayers,
-              allAwayPlayers
-            );
-
-            const latestEvent = gameState.events[gameState.events.length - 1];
-
+            tick++;
+            gameState = getNextGameState(gameState, teamHome, teamAway, homePlayers, awayPlayers);
+            const lastEvent = gameState.events[gameState.events.length - 1];
             await gameRef.update({
-              liveTickerEvents: FieldValue.arrayUnion(latestEvent),
+              liveTickerEvents: FieldValue.arrayUnion(lastEvent),
               minute: gameState.minute,
               scoreHome: gameState.score.home,
               scoreAway: gameState.score.away,
             });
-
-            if (currentTick >= totalTicks || gameState.minute >= 90) {
-              clearInterval(tickInterval);
-              // Spielerbewertungen berechnen und speichern
-              const ratings = calculateRatingsFromEvents(
-                gameState.events,
-                allHomePlayers,
-                allAwayPlayers
-              );
-              await gameRef.update({
-                status: "finished",
-                playerRatings: ratings,
-              });
+            if (tick >= totalTicks || gameState.minute >= 90) {
+              clearInterval(interval);
+              const ratings = calculateRatingsFromEvents(gameState.events, homePlayers, awayPlayers);
+              await gameRef.update({ status: "finished", playerRatings: ratings });
               logger.info(`✅ Simulation für Spiel ${gameId} beendet.`);
             }
           } catch (err) {
             logger.error("Fehler im Simulationstakt:", err);
-            clearInterval(tickInterval);
+            clearInterval(interval);
             await gameRef.update({
               status: "error",
               liveTickerEvents: FieldValue.arrayUnion({ text: `Simulationsfehler: ${err.message}` }),
             });
           }
         }, 5000);
-      } catch (error) {
-        logger.error(`Fehler in Simulation ${gameId}:`, error);
+      } catch (err) {
+        logger.error(`Fehler in Simulation ${gameId}:`, err);
         await db.collection("games").doc(gameId).update({
           status: "error",
-          liveTickerEvents: FieldValue.arrayUnion({ text: `Simulationsfehler: ${error.message}` }),
+          liveTickerEvents: FieldValue.arrayUnion({ text: `Simulationsfehler: ${err.message}` }),
         });
       }
     }
@@ -156,20 +109,19 @@ exports.startSimulation = onDocumentUpdated(
 // --- SPIEL-EINLADUNG ---
 exports.acceptGameInvite = onCall(
   { region: "europe-west3" },
-  async (request) => {
-    const { inviteId } = request.data;
+  async (req) => {
+    const { inviteId } = req.data;
     if (!inviteId) throw new HttpsError('invalid-argument', 'inviteId fehlt.');
-    const inviteRef = db.collection('game_invites').doc(inviteId);
-    const inviteDoc = await inviteRef.get();
-    if (!inviteDoc.exists) throw new HttpsError('not-found', 'Einladung nicht gefunden.');
-
-    const inviteData = inviteDoc.data();
+    const invRef = db.collection('game_invites').doc(inviteId);
+    const invSnap = await invRef.get();
+    if (!invSnap.exists) throw new HttpsError('not-found', 'Einladung nicht gefunden.');
+    const inv = invSnap.data();
     const gameRef = db.collection('games').doc();
     await gameRef.set({
-      teamHomeId: inviteData.proposingTeamId,
-      teamAwayId: inviteData.receivingTeamId,
-      teamIds: [inviteData.proposingTeamId, inviteData.receivingTeamId],
-      scheduledStartTime: inviteData.proposedDate,
+      teamHomeId: inv.proposingTeamId,
+      teamAwayId: inv.receivingTeamId,
+      teamIds: [inv.proposingTeamId, inv.receivingTeamId],
+      scheduledStartTime: inv.proposedDate,
       status: 'scheduled',
       type: 'FS',
       competitionCategory: 'FS',
@@ -178,7 +130,7 @@ exports.acceptGameInvite = onCall(
       scoreAway: 0,
       liveTickerEvents: []
     });
-    await inviteRef.delete();
+    await invRef.delete();
     return { message: "Spiel erfolgreich angesetzt!" };
   }
 );
@@ -186,25 +138,19 @@ exports.acceptGameInvite = onCall(
 // --- SPIEL-AUTO-STARTER ---
 exports.checkScheduledGames = onSchedule(
   { region: "europe-west3", schedule: "every 1 minutes" },
-  async (event) => {
+  async () => {
     logger.info("Suche nach zu startenden Spielen...");
     const now = new Date();
     const q = db.collection("games")
       .where("status", "==", "scheduled")
       .where("scheduledStartTime", "<=", now);
-    const snapshot = await q.get();
-
-    if (snapshot.empty) {
+    const snap = await q.get();
+    if (snap.empty) {
       logger.info("Keine Spiele zum Starten gefunden.");
       return null;
     }
-
     const batch = db.batch();
-    snapshot.docs.forEach((doc) => {
-      logger.info(`Starte Spiel ${doc.id}...`);
-      batch.update(doc.ref, { status: 'live' });
-    });
-
+    snap.docs.forEach(doc => batch.update(doc.ref, { status: 'live' }));
     await batch.commit();
     return null;
   }
@@ -213,67 +159,90 @@ exports.checkScheduledGames = onSchedule(
 // --- CLEANUP INVITES ---
 exports.cleanupOldInvites = onSchedule(
   { region: "europe-west3", schedule: "every 1 hours" },
-  async (event) => {
-    const twelveHoursAgo = new Date(Date.now() - 12 * 60 * 60 * 1000);
+  async () => {
+    const cutoff = new Date(Date.now() - 12 * 60 * 60 * 1000);
     const q = db.collection('game_invites')
       .where("status", "==", "pending")
-      .where("createdAt", "<=", twelveHoursAgo);
-    const snapshot = await q.get();
-    if (snapshot.empty) return null;
-
+      .where("createdAt", "<=", cutoff);
+    const snap = await q.get();
+    if (snap.empty) return null;
     const batch = db.batch();
-    snapshot.docs.forEach((doc) => {
-      logger.info(`Lösche abgelaufene Einladung: ${doc.id}`);
-      batch.delete(doc.ref);
-    });
+    snap.docs.forEach(doc => batch.delete(doc.ref));
     await batch.commit();
     return null;
   }
 );
 
 // --- ADMIN ROLE ---
-exports.addAdminRole = onCall({ region: "europe-west3" }, async (request) => {
-  try {
-    const email = request.data.email;
-    const user = await auth.getUserByEmail(email);
-    await auth.setCustomUserClaims(user.uid, { admin: true });
-    logger.info(`Erfolg! User ${email} ist jetzt ein Admin.`);
-    return { message: `Erfolg! ${email} ist jetzt ein Admin.` };
-  } catch (error) {
-    logger.error("Fehler beim Hinzufügen der Admin-Rolle:", error);
-    throw new HttpsError('internal', error.message);
+exports.addAdminRole = onCall(
+  { region: "europe-west3" },
+  async (req) => {
+    try {
+      const userRec = await auth.getUserByEmail(req.data.email);
+      await auth.setCustomUserClaims(userRec.uid, { admin: true });
+      logger.info(`User ${req.data.email} ist jetzt Admin.`);
+      return { message: `Erfolg! ${req.data.email} ist jetzt Admin.` };
+    } catch (err) {
+      logger.error("Fehler beim Hinzufügen der Admin-Rolle:", err);
+      throw new HttpsError('internal', err.message);
+    }
   }
-});
+);
 
-// --- TRANSFER AUSFÜHREN ---
-exports.executeTransfer = onCall({ region: "europe-west3" }, async (request) => {
-  const { transferId } = request.data;
-  if (!transferId) throw new HttpsError('invalid-argument', 'transferId fehlt.');
+// --- TRANSFER AUSFÜHREN (Admin) ---
+exports.executeTransfer = onCall(
+  { region: "europe-west3" },
+  async (req) => {
+    const { transferId } = req.data;
+    if (!transferId) {
+      throw new HttpsError("invalid-argument", "transferId fehlt.");
+    }
 
-  const transferRef = db.collection('transfers').doc(transferId);
-  try {
-    const transferDoc = await transferRef.get();
-    if (!transferDoc.exists) throw new HttpsError('not-found', 'Transfer nicht gefunden.');
+    const transferRef = db.collection("transfers").doc(transferId);
+    const snap = await transferRef.get();
+    if (!snap.exists) {
+      throw new HttpsError("not-found", "Transfer nicht gefunden.");
+    }
+    const t = snap.data();
+    logger.info(`executeTransfer aufgerufen für ${transferId}, status=${t.status}`);
 
-    const transferData = transferDoc.data();
-    const batch = db.batch();
+    // Nur Transfers bearbeiten, die der Empfänger bereits akzeptiert hat
+    if (t.status !== "acceptedByUser") {
+      throw new HttpsError(
+        "failed-precondition",
+        `Transfer im falschen Status (${t.status}). Nur 'acceptedByUser' ist zulässig.`
+      );
+    }
 
-    transferData.offeredPlayerIds.forEach(playerId => {
-      const playerRef = db.collection('players').doc(playerId);
-      batch.update(playerRef, { teamId: transferData.receivingTeamId });
-    });
+    const myPlayers  = Array.isArray(t.myPlayers )  ? t.myPlayers  : [];
+    const oppPlayers = Array.isArray(t.oppPlayers) ? t.oppPlayers : [];
 
-    transferData.requestedPlayerIds.forEach(playerId => {
-      const playerRef = db.collection('players').doc(playerId);
-      batch.update(playerRef, { teamId: transferData.proposingTeamId });
-    });
+    try {
+      const batch = db.batch();
 
-    batch.update(transferRef, { status: 'completed' });
-    await batch.commit();
-    logger.info(`Transfer ${transferId} erfolgreich ausgeführt.`);
-    return { message: "Transfer erfolgreich!" };
-  } catch (error) {
-    logger.error(`Fehler bei Transfer ${transferId}:`, error);
-    throw new HttpsError('internal', 'Transfer konnte nicht ausgeführt werden.');
+      // Eigene Spieler → Gegner-Team
+      myPlayers.forEach(pid => {
+        const pRef = db.collection("players").doc(pid);
+        batch.update(pRef, { teamId: t.toTeamId });
+      });
+      // Gegner-Spieler → eigenes Team
+      oppPlayers.forEach(pid => {
+        const pRef = db.collection("players").doc(pid);
+        batch.update(pRef, { teamId: t.fromTeamId });
+      });
+
+      // Transfer abschließen
+      batch.update(transferRef, {
+        status:     "completed",
+        executedAt: FieldValue.serverTimestamp()
+      });
+
+      await batch.commit();
+      logger.info(`✅ Transfer ${transferId} abgeschlossen.`);
+      return { success: true };
+    } catch (err) {
+      logger.error(`Fehler bei executeTransfer ${transferId}:`, err);
+      throw new HttpsError("internal", "Fehler beim Ausführen des Transfers.");
+    }
   }
-});
+);
