@@ -7,7 +7,7 @@ const { initializeApp } = require("firebase-admin/app");
 const { getAuth } = require("firebase-admin/auth");
 const logger = require("firebase-functions/logger");
 
-const { getNextGameState } = require("./simulationEngine");
+const { getNextGameState } = require('./simulation/engine');
 
 initializeApp({ projectId: "deadlineday-sim" });
 const db = getFirestore();
@@ -48,60 +48,122 @@ exports.startSimulation = onDocumentUpdated(
   async (event) => {
     const before = event.data.before.data();
     const after  = event.data.after.data();
+
+    // Nur beim Statuswechsel scheduled → live starten
     if (before.status === "scheduled" && after.status === "live") {
-      const gameId = event.params.gameId;
+      const gameId  = event.params.gameId;
       const gameRef = db.collection("games").doc(gameId);
-      logger.info(`✅ Simulation für Spiel ${gameId} gestartet!`);
+
+      logger.info(`✅ Simulation für Spiel ${gameId} startet jetzt!`);
+
       try {
+        // 1. Teams laden
         const [teamHomeDoc, teamAwayDoc] = await Promise.all([
           db.collection("teams").doc(after.teamHomeId).get(),
           db.collection("teams").doc(after.teamAwayId).get(),
         ]);
+        if (!teamHomeDoc.exists || !teamAwayDoc.exists) {
+          throw new Error("Team nicht gefunden.");
+        }
         const teamHome = { id: teamHomeDoc.id, ...teamHomeDoc.data() };
         const teamAway = { id: teamAwayDoc.id, ...teamAwayDoc.data() };
+
+        // 2. Formation aus dem Team‐Doc extrahieren
+        //    Annahme: teamHome.formation ist entweder Array von IDs oder Objekt mapping pos→ID
+        const lineupHome = Array.isArray(teamHome.formation)
+          ? teamHome.formation
+          : Object.values(teamHome.formation || {});
+        const lineupAway = Array.isArray(teamAway.formation)
+          ? teamAway.formation
+          : Object.values(teamAway.formation || {});
+
+        // 3. Formation ins Spiel-Dokument schreiben
+        await gameRef.update({ lineupHome, lineupAway });
+
+        // 4. Alle Spieler des Kaders laden
         const [homeSnap, awaySnap] = await Promise.all([
           db.collection("players").where("teamId", "==", teamHome.id).get(),
           db.collection("players").where("teamId", "==", teamAway.id).get(),
         ]);
-        const homePlayers = homeSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-        const awayPlayers = awaySnap.docs.map(d => ({ id: d.id, ...d.data() }));
-        let gameState = { minute: 0, events: [], score: { home: 0, away: 0 } };
-        let tick = 0;
+        const allHomePlayers = homeSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+        const allAwayPlayers = awaySnap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+        // 5. Simulation initialisieren
+        let gameState = {
+          minute: 0,
+          events: [],
+          score: { home: 0, away: 0 },
+          playerWithBall: null,
+          possession: null,
+          ballZone: null,
+          justWonDuel: false,
+          attackTicks: 0,
+          playerRatings: {},
+          ratingEventsBuffer: [],
+        };
+
         const totalTicks = 120;
+        let tickCount = 0;
+
+        // 6. Simulationstakt
         const interval = setInterval(async () => {
           try {
-            tick++;
-            gameState = getNextGameState(gameState, teamHome, teamAway, homePlayers, awayPlayers);
-            const lastEvent = gameState.events[gameState.events.length - 1];
+            tickCount++;
+
+            // Hier wird jetzt die Formation übergeben:
+            gameState = getNextGameState(
+              gameState,
+              teamHome,
+              teamAway,
+              allHomePlayers,
+              allAwayPlayers,
+              lineupHome,
+              lineupAway
+            );
+
+            // Aktuelles Event ans Game‐Doc hängen
+            const latestEvent = gameState.events[gameState.events.length - 1];
             await gameRef.update({
-              liveTickerEvents: FieldValue.arrayUnion(lastEvent),
-              minute: gameState.minute,
-              scoreHome: gameState.score.home,
-              scoreAway: gameState.score.away,
+              liveTickerEvents: FieldValue.arrayUnion(latestEvent),
+              minute:           gameState.minute,
+              scoreHome:        gameState.score.home,
+              scoreAway:        gameState.score.away,
             });
-            if (tick >= totalTicks || gameState.minute >= 90) {
+
+            // Ende der Simulation?
+            if (tickCount >= totalTicks || gameState.minute >= 90) {
               clearInterval(interval);
-              const ratings = calculateRatingsFromEvents(gameState.events, homePlayers, awayPlayers);
-              await gameRef.update({ status: "finished", playerRatings: ratings });
+
+              // Spielerbewertungen berechnen
+              const ratings = calculateRatingsFromEvents(
+                gameState.events,
+                allHomePlayers,
+                allAwayPlayers
+              );
+              await gameRef.update({
+                status:        "finished",
+                playerRatings: ratings,
+              });
               logger.info(`✅ Simulation für Spiel ${gameId} beendet.`);
             }
           } catch (err) {
-            logger.error("Fehler im Simulationstakt:", err);
             clearInterval(interval);
+            logger.error("Fehler im Simulationstakt:", err);
             await gameRef.update({
-              status: "error",
-              liveTickerEvents: FieldValue.arrayUnion({ text: `Simulationsfehler: ${err.message}` }),
+              status:           "error",
+              liveTickerEvents: FieldValue.arrayUnion({ text: `Simulationsfehler: ${err.message}` })
             });
           }
         }, 5000);
       } catch (err) {
-        logger.error(`Fehler in Simulation ${gameId}:`, err);
-        await db.collection("games").doc(gameId).update({
-          status: "error",
-          liveTickerEvents: FieldValue.arrayUnion({ text: `Simulationsfehler: ${err.message}` }),
+        logger.error(`Fehler beim Start der Simulation ${gameId}:`, err);
+        await gameRef.update({
+          status:           "error",
+          liveTickerEvents: FieldValue.arrayUnion({ text: `Initialfehler: ${err.message}` })
         });
       }
     }
+
     return null;
   }
 );
