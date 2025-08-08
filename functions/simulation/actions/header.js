@@ -10,7 +10,7 @@ const { choosePlayer, weightedRandomChance } = require("../utils/random");
 /**
  * Simuliert einen Kopfball und gibt das Ergebnisobjekt zurück.
  */
-function doHeader({
+function simulateHeader({
   attacker,
   opp,
   ballTeam,
@@ -70,4 +70,4 @@ function doHeader({
   }
 }
 
-module.exports = { doHeader };
+module.exports = { simulateHeader };

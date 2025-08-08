@@ -10,7 +10,7 @@ const { choosePlayer, weightedRandomChance } = require("../utils/random");
 /**
  * Simuliert einen Freistoß und gibt das Ergebnisobjekt zurück.
  */
-function doFreekick({
+function simulateFreekick({
   attacker,
   opp,
   ballTeam,
@@ -70,4 +70,4 @@ function doFreekick({
   }
 }
 
-module.exports = { doFreekick };
+module.exports = { simulateFreekick };

@@ -10,7 +10,7 @@ const { applyDelta } = require("../rating");
 /**
  * Simuliert eine Pass-Aktion und gibt das Ergebnis zurück.
  */
-function doPass({
+function simulatePass({
   attacker,
   poss,
   mates,
@@ -84,4 +84,4 @@ function doPass({
   }
 }
 
-module.exports = { doPass };
+module.exports = { simulatePass };

@@ -33,7 +33,7 @@ function getKickoffState(home, away, homeTeam, awayTeam, state) {
     text,
     type: "kickoff",
     possession: isHome ? "home" : "away",
-    playerWithBall: safePlayerRef(kick), // für Events nur die ID
+    playerWithBall: safePlayerRef(kick) // nur die ID für den Event-Log
   };
 
   return {
@@ -44,6 +44,7 @@ function getKickoffState(home, away, homeTeam, awayTeam, state) {
     possession:     isHome ? "home" : "away",
     justWonDuel:    false,
     attackTicks:    0,
+    pendingAction:  null
   };
 }
 
@@ -63,10 +64,10 @@ function getNextGameState(
   const home = assignDetail(rawHome, lineupHome);
   const away = assignDetail(rawAway, lineupAway);
 
-  // Ratings initialisieren (nur aufgestellte)
+  // Ratings initialisieren (nur aufgestellte Spieler)
   const playerRatings = initRatings([...home, ...away], state?.playerRatings);
 
-  // Nur beim ALLERERSTEN TICK Kickoff!
+  // Beim allerersten Tick: Kickoff-Event erzeugen
   if (!state || !state.events || state.events.length === 0) {
     return getKickoffState(
       home, away, homeTeam, awayTeam,
@@ -76,103 +77,156 @@ function getNextGameState(
         playerWithBall:   null,
         ballZone:         null,
         events:           [],
-        score:            { home:0, away:0 },
+        score:            { home: 0, away: 0 },
         justWonDuel:      false,
         attackTicks:      0,
         playerRatings,
         ratingEventsBuffer: [],
+        pendingAction:    null
       }
     );
   }
 
   // --- Ablauf eines normalen Simulations-Ticks ---
-  const isHome      = state.possession === "home";
-  const ballTeam    = isHome ? "home" : "away";
-  const oppTeam     = isHome ? "away" : "home";
-  const poss        = isHome ? home : away;
-  const opp         = isHome ? away : home;
-  const { rel:curRel } = parseZone(state.ballZone);
-  const currentMin  = (state.minute || 0) + 90 / 120;
+  const isHome    = state.possession === "home";
+  const ballTeam  = isHome ? "home" : "away";
+  const oppTeam   = isHome ? "away" : "home";
+  const poss      = isHome ? home : away;
+  const opp       = isHome ? away : home;
+  const { rel: curRel } = parseZone(state.ballZone);
+  const currentMin = (state.minute || 0) + 90 / 120;
 
-  let nextPoss     = state.possession;
-  let nextPlayer   = state.playerWithBall;
-  let nextZone     = state.ballZone;
-  let nextScore    = { ...state.score };
-  let action       = chooseAction(curRel);
-  let text         = "";
+  let nextPoss   = state.possession;
+  let nextPlayer = state.playerWithBall;
+  let nextZone   = state.ballZone;
+  let nextScore  = { ...state.score };
+  let text       = "";
 
   const tickDeltas = {};
 
-  // ----------- WICHTIG: Spielerobjekt aus playerWithBall-ID suchen -----------
-  // Falls playerWithBall KEIN Spielerobjekt (sondern nur ID) ist:
+  // Spielerobjekt aus playerWithBall-ID holen (falls aktuell nur ID gespeichert)
   if (typeof nextPlayer === "string") {
     nextPlayer = poss.find(p => p.id === nextPlayer) || poss[0];
   }
 
-  // Angreifer wählen (möglichst den, der gerade am Ball ist)
+  // Angreifer bestimmen (möglichst den aktuellen Ballführer)
   let attacker = poss.find(p => p.id === nextPlayer.id) || poss[0];
 
-  // Verteidiger wählen
+  // Verteidiger bestimmen (aus gegnerischer Spiegelzone wählen, sonst Zufall)
   const defZone = parseZone(opponentZone(state.ballZone)).rel;
   let defList = getPlayersByZone(opp.filter(p => p.position !== "TW"), defZone);
   if (!defList.length) defList = opp.filter(p => p.position !== "TW");
   let defender = defList.length ? defList[Math.floor(Math.random() * defList.length)] : attacker;
 
-  // justWonDuel → Pass erzwingen
-  if (state.justWonDuel && action === "duel") {
-    action     = "pass";
-    nextPlayer = attacker;
-    nextZone   = buildZone(ballTeam,"midfield");
+  // Nächste Aktion festlegen (inkl. erzwungener Aktionen)
+  let action;
+  if (state.pendingAction) {
+    // Vorher gesetzte Aktion (z.B. nach Foul oder Dribbling) ausführen
+    action = state.pendingAction;
+  } else {
+    action = chooseAction(curRel);
+    if (state.justWonDuel && action === "duel") {
+      // Nach gewonnenem Zweikampf keinen erneuten Zweikampf, sondern Pass
+      action     = "pass";
+      nextPlayer = attacker;
+      nextZone   = buildZone(ballTeam, "midfield");
+    }
   }
+  // Status-Flags zurücksetzen
   state.justWonDuel = false;
+  state.pendingAction = null;
 
-  // Aktionen dispatchen:
+  // Aktion ausführen
+  let result;
   switch (action) {
     case "pass":
-      ({ nextPoss, nextPlayer, nextZone, text } = passActions.simulatePass({
+      result = passActions.simulatePass({
         poss, attacker, defender, curRel, ballTeam, oppTeam, state, currentMin, tickDeltas, playerRatings
-      }));
+      });
       break;
     case "dribble":
-      ({ nextPoss, nextPlayer, nextZone, text } = dribbleActions.simulateDribble({
-        poss, attacker, defender, curRel, ballTeam, oppTeam, state, currentMin, tickDeltas, playerRatings
-      }));
+      result = dribbleActions.simulateDribble({
+        poss, attacker, defender, opp, curRel, ballTeam, oppTeam, state, currentMin, tickDeltas, playerRatings
+      });
       break;
     case "killerPass":
-      ({ nextPoss, nextPlayer, nextZone, text } = killerPassActions.simulateKillerPass({
-        poss, attacker, defender, curRel, ballTeam, oppTeam, state, currentMin, tickDeltas, playerRatings
-      }));
+      result = killerPassActions.simulateKillerPass({
+        poss, attacker, defender, opp, curRel, ballTeam, oppTeam, state, currentMin, tickDeltas, playerRatings
+      });
       break;
     case "duel":
-      ({ nextPoss, nextPlayer, nextZone, text } = duelActions.simulateDuel({
-        poss, attacker, defender, curRel, ballTeam, oppTeam, state, currentMin, tickDeltas, playerRatings
-      }));
+      result = duelActions.simulateDuel({
+        poss, attacker, defender, opp, curRel, ballTeam, oppTeam, state, currentMin, tickDeltas, playerRatings,
+        homeTeam, awayTeam
+      });
       break;
     case "shoot":
-      ({ nextPoss, nextPlayer, nextZone, text } = shootActions.simulateShoot({
-        poss, attacker, defender, curRel, ballTeam, oppTeam, state, currentMin, tickDeltas, playerRatings
-      }));
+      result = shootActions.simulateShoot({
+        poss, attacker, defender, opp, curRel, ballTeam, oppTeam, state, currentMin, tickDeltas, playerRatings
+      });
       break;
     case "header":
-      ({ nextPoss, nextPlayer, nextZone, text } = headerActions.simulateHeader({
-        poss, attacker, defender, curRel, ballTeam, oppTeam, state, currentMin, tickDeltas, playerRatings
-      }));
+      result = headerActions.simulateHeader({
+        poss, attacker, defender, opp, curRel, ballTeam, oppTeam, state, currentMin, tickDeltas, playerRatings
+      });
       break;
     case "freekick":
-      ({ nextPoss, nextPlayer, nextZone, text } = freekickActions.simulateFreekick({
-        poss, attacker, defender, curRel, ballTeam, oppTeam, state, currentMin, tickDeltas, playerRatings
-      }));
+      result = freekickActions.simulateFreekick({
+        poss, attacker, defender, opp, curRel, ballTeam, oppTeam, state, currentMin, tickDeltas, playerRatings
+      });
       break;
     default:
-      text     = `${Math.round(currentMin)}' – Ball läuft in den eigenen Reihen.`;
-      nextZone = state.ballZone;
+      // Keine besondere Aktion – Ball halten
+      result = {
+        nextPlayer: attacker,
+        nextZone: state.ballZone,
+        text: `${Math.round(currentMin)}' – Ball läuft in den eigenen Reihen.`
+      };
       break;
   }
 
-  // Rating-Decay
+  // Ergebnis der Aktion verarbeiten
+  if (result.switchPossession) {
+    // Ballbesitz wechselt zur gegnerischen Mannschaft
+    nextPoss = oppTeam;
+  } else {
+    nextPoss = ballTeam;
+  }
+  if (result.goal) {
+    // Tor: Spielstand aktualisieren und Anstoß für das gegnerische Team
+    if (ballTeam === "home") {
+      nextScore.home++;
+    } else {
+      nextScore.away++;
+    }
+    nextPoss = oppTeam;
+    const mids = getPlayersByZone(opp, "midfield");
+    const kickPlayer = mids.length ? mids[Math.floor(Math.random() * mids.length)] : opp[0];
+    nextPlayer = kickPlayer;
+    nextZone   = buildZone(oppTeam, "midfield");
+  } else {
+    nextPlayer = result.nextPlayer || nextPlayer;
+    nextZone   = result.nextZone   || nextZone;
+  }
+  text = result.text || text;
+
+  // Flags für den nächsten Tick setzen
+  let nextJustWonDuel = false;
+  let nextPendingAction = null;
+  if (result.justWonDuel) {
+    nextJustWonDuel = true;
+  }
+  if (result.foul) {
+    nextPendingAction = "freekick";
+  }
+  if (result.actionOverride) {
+    nextPendingAction = result.actionOverride;
+  }
+
+  // Spielerbewertungen minimal Richtung Ausgangswert deklinieren
   decayRatings(playerRatings);
 
-  // Rating-events puffern
+  // Bewertung-Events zwischenspeichern
   const ratingEventsBuffer = appendRatingEvents(
     state.ratingEventsBuffer,
     tickDeltas,
@@ -180,29 +234,30 @@ function getNextGameState(
     action
   );
 
-  // Aktuelles Event
+  // Aktuelles Event protokollieren
   const evt = {
-    minute:         Math.round(currentMin),
+    minute:        Math.round(currentMin),
     text,
-    type:           action,
-    possession:     nextPoss,
-    playerWithBall: safePlayerRef(nextPlayer) // Nur ID für den Event-Log
+    type:          action,
+    possession:    nextPoss,
+    playerWithBall: safePlayerRef(nextPlayer)
   };
 
-  // Neuer State
+  // Neuen Spielstand zurückgeben
   return {
-    minute:           currentMin,
-    possession:       nextPoss,
-    playerWithBall:   nextPlayer, // Immer Spielerobjekt!
-    ballZone:         nextZone,
-    events:           [...state.events, evt],
-    score:            nextScore,
-    justWonDuel:      state.justWonDuel,
-    attackTicks:      (nextPoss===state.possession && nextZone.endsWith("Attack"))
-                        ? (state.attackTicks||0) + 1
-                        : 0,
+    minute:         currentMin,
+    possession:     nextPoss,
+    playerWithBall: nextPlayer, // Spielerobjekt (für nächsten Tick)
+    ballZone:       nextZone,
+    events:         [...state.events, evt],
+    score:          nextScore,
+    justWonDuel:    nextJustWonDuel,
+    attackTicks:    (nextPoss === state.possession && nextZone.endsWith("Attack"))
+                     ? (state.attackTicks || 0) + 1
+                     : 0,
     playerRatings,
-    ratingEventsBuffer
+    ratingEventsBuffer,
+    pendingAction:  nextPendingAction
   };
 }
 

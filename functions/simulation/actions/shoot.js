@@ -10,7 +10,7 @@ const { choosePlayer, weightedRandomChance } = require("../utils/random");
 /**
  * Simuliert einen Torschuss und gibt das Ergebnisobjekt zurück.
  */
-function doShoot({
+function simulateShoot({
   attacker,
   opp,
   ballTeam,
@@ -70,4 +70,4 @@ function doShoot({
   }
 }
 
-module.exports = { doShoot };
+module.exports = { simulateShoot };

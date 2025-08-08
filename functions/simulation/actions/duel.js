@@ -10,7 +10,7 @@ const { choosePlayer, weightedRandomChance } = require("../utils/random");
 /**
  * Simuliert einen Zweikampf (Duel) und gibt das Ergebnisobjekt zurück.
  */
-function doDuel({
+function simulateDuel({
   attacker,
   defender,
   poss,
@@ -97,4 +97,4 @@ function doDuel({
   }
 }
 
-module.exports = { doDuel };
+module.exports = { simulateDuel };

@@ -10,7 +10,7 @@ const { applyDelta } = require("../rating");
 /**
  * Simuliert ein Dribbling und gibt das Ergebnisobjekt zurück.
  */
-function doDribble({
+function simulateDribble({
   attacker,
   poss,
   opp,
@@ -96,4 +96,4 @@ function doDribble({
   }
 }
 
-module.exports = { doDribble };
+module.exports = { simulateDribble };

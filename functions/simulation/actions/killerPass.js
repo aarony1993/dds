@@ -10,7 +10,7 @@ const { applyDelta } = require("../rating");
 /**
  * Simuliert einen Killerpass und gibt das Ergebnisobjekt zurück.
  */
-function doKillerPass({
+function simulateKillerPass({
   attacker,
   poss,
   opp,
@@ -64,4 +64,4 @@ function doKillerPass({
   }
 }
 
-module.exports = { doKillerPass };
+module.exports = { simulateKillerPass };
