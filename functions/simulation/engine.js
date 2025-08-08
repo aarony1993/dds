@@ -1,5 +1,3 @@
-// functions/simulation/engine.js
-
 const { assignDetail } = require("./utils/positions");
 const { chooseAction } = require("./chooser");
 const { getNextRelativeZone, getPreviousRelativeZone, buildZone, parseZone, getPlayersByZone, opponentZone } = require("./utils/zones");
@@ -34,14 +32,14 @@ function getKickoffState(home, away, homeTeam, awayTeam, state) {
     minute: state.minute,
     text,
     type: "kickoff",
-    possession: state.possession,
-    playerWithBall: safePlayerRef(kick),
+    possession: isHome ? "home" : "away",
+    playerWithBall: safePlayerRef(kick), // für Events nur die ID
   };
 
   return {
     ...state,
     events:         [...state.events, evt],
-    playerWithBall: kick,
+    playerWithBall: kick,  // IMMER das Spielerobjekt!
     ballZone:       zone,
     possession:     isHome ? "home" : "away",
     justWonDuel:    false,
@@ -68,8 +66,8 @@ function getNextGameState(
   // Ratings initialisieren (nur aufgestellte)
   const playerRatings = initRatings([...home, ...away], state?.playerRatings);
 
-  // Erster Aufruf → Kickoff
-  if (!state || !state.playerWithBall) {
+  // Nur beim ALLERERSTEN TICK Kickoff!
+  if (!state || !state.events || state.events.length === 0) {
     return getKickoffState(
       home, away, homeTeam, awayTeam,
       {
@@ -105,10 +103,14 @@ function getNextGameState(
 
   const tickDeltas = {};
 
-  // Angreifer wählen
-  let poolAtt = poss.filter(p => p.id !== state.playerWithBall.id);
-  if (!poolAtt.length) poolAtt = poss;
-  let attacker = poolAtt.find(p => p.id === state.playerWithBall.id) || poolAtt[0];
+  // ----------- WICHTIG: Spielerobjekt aus playerWithBall-ID suchen -----------
+  // Falls playerWithBall KEIN Spielerobjekt (sondern nur ID) ist:
+  if (typeof nextPlayer === "string") {
+    nextPlayer = poss.find(p => p.id === nextPlayer) || poss[0];
+  }
+
+  // Angreifer wählen (möglichst den, der gerade am Ball ist)
+  let attacker = poss.find(p => p.id === nextPlayer.id) || poss[0];
 
   // Verteidiger wählen
   const defZone = parseZone(opponentZone(state.ballZone)).rel;
@@ -184,14 +186,14 @@ function getNextGameState(
     text,
     type:           action,
     possession:     nextPoss,
-    playerWithBall: safePlayerRef(nextPlayer)
+    playerWithBall: safePlayerRef(nextPlayer) // Nur ID für den Event-Log
   };
 
   // Neuer State
   return {
     minute:           currentMin,
     possession:       nextPoss,
-    playerWithBall:   nextPlayer,
+    playerWithBall:   nextPlayer, // Immer Spielerobjekt!
     ballZone:         nextZone,
     events:           [...state.events, evt],
     score:            nextScore,
