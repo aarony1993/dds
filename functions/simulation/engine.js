@@ -1,264 +1,217 @@
-const { assignDetail } = require("./utils/positions");
-const { chooseAction } = require("./chooser");
-const { getNextRelativeZone, getPreviousRelativeZone, buildZone, parseZone, getPlayersByZone, opponentZone } = require("./utils/zones");
-const { initRatings, applyDelta, decayRatings } = require("./rating");
-const { appendRatingEvents } = require("./rating/eventsBuffer");
-const { formatName, safePlayerRef, describe } = require("./utils/formatters");
-const passActions      = require("./actions/pass");
-const dribbleActions   = require("./actions/dribble");
-const killerPassActions= require("./actions/killerPass");
-const duelActions      = require("./actions/duel");
-const shootActions     = require("./actions/shoot");
-const headerActions    = require("./actions/header");
-const freekickActions  = require("./actions/freekick");
+import * as actions from './actions.js';
+import { getPlayerById, getOpponent } from './utils.js';
+import { createLogEntry } from './logger.js';
 
 /**
- * Initialisiert den ersten Spielstatus (Kickoff).
+ * Initialisiert den zentralen Spielzustand (GameState) für ein neues Spiel.
  */
-function getKickoffState(home, away, homeTeam, awayTeam, state) {
-  const isHome  = Math.random() < 0.5;
-  const teamPl  = isHome ? home : away;
-  const teamInf = isHome ? homeTeam : awayTeam;
-  const mids    = getPlayersByZone(teamPl, "midfield");
-  const kick    = mids.length ? mids[Math.floor(Math.random() * mids.length)] : teamPl[0];
-  const zone    = buildZone(isHome ? "home" : "away", "midfield");
-  const text    = describe("kickoff", {
-    minute: state.minute,
-    team: teamInf.name,
-    attacker: formatName(kick),
+function initializeGameState(homeTeam, awayTeam, players, homeLineup, awayLineup) {
+  const startingPlayerId = homeLineup.find(pos => pos.position === 'ZM')?.playerId || homeLineup.find(pos => pos.positionGroup === 'MID')?.playerId || homeLineup[5].playerId;
+  const startingPlayer = players.find(p => p.id === startingPlayerId);
+
+  const playerRatings = {};
+  const playerStats = {};
+
+  players.forEach(p => {
+    playerRatings[p.id] = 6.0;
+    playerStats[p.id] = {
+      shots: 0, shotsOnTarget: 0, goals: 0, assists: 0,
+      passes: 0, passesCompleted: 0,
+      dribbles: 0, dribblesSucceeded: 0,
+      tackles: 0, tacklesSucceeded: 0,
+      foulsCommitted: 0, saves: 0,
+      crosses: 0, crossesCompleted: 0,
+      throughBalls: 0, throughBallsCompleted: 0,
+      interceptions: 0,
+    };
   });
 
-  const evt = {
-    minute: state.minute,
-    text,
-    type: "kickoff",
-    possession: isHome ? "home" : "away",
-    playerWithBall: safePlayerRef(kick) // nur die ID für den Event-Log
-  };
-
   return {
-    ...state,
-    events:         [...state.events, evt],
-    playerWithBall: kick,  // IMMER das Spielerobjekt!
-    ballZone:       zone,
-    possession:     isHome ? "home" : "away",
-    justWonDuel:    false,
-    attackTicks:    0,
-    pendingAction:  null
+    minute: 0,
+    homeScore: 0,
+    awayScore: 0,
+    homeTeam,
+    awayTeam,
+    players,
+    homeLineup,
+    awayLineup,
+    playerRatings,
+    playerStats,
+    // Fügt die Taktiken dem gameState hinzu
+    homeTeamTactics: {
+      defensiveLine: homeTeam.tacticDefensiveLine || 'normal',
+      passStyle: homeTeam.tacticPassStyle || 'gemischt',
+    },
+    awayTeamTactics: {
+      defensiveLine: awayTeam.tacticDefensiveLine || 'normal',
+      passStyle: awayTeam.tacticPassStyle || 'gemischt',
+    },
+    ball: {
+      inPossessionOfTeam: homeTeam.id,
+      playerInPossessionId: startingPlayer.id,
+      zone: 'HOME_MIDFIELD',
+      context: { type: 'OPEN_PLAY' }
+    },
+    log: [createLogEntry('GAME_START', { homeTeam, awayTeam, minute: 0 }, { player: startingPlayer })],
+    half: 1,
   };
 }
 
 /**
- * Hauptsimulationsschritt – ruft die Logikmodule auf.
+ * Die KI-Logik, die die nächste Aktion für einen Spieler bestimmt.
  */
-function getNextGameState(
-  state,
-  homeTeam,
-  awayTeam,
-  rawHome,
-  rawAway,
-  lineupHome = null,
-  lineupAway = null
-) {
-  // Nur aufgestellte Spieler verwenden
-  const home = assignDetail(rawHome, lineupHome);
-  const away = assignDetail(rawAway, lineupAway);
+function determineAction(player, gameState) {
+  const context = gameState.ball.context || {};
+  if (context.priorityAction) return context.priorityAction;
+  if (context.type === 'FREE_KICK') return 'HANDLE_FREE_KICK';
+  if (context.type === 'REBOUND') return 'SCRAMBLE_FOR_REBOUND';
+  
+  const lineup = player.teamId === gameState.homeTeam.id ? gameState.homeLineup : gameState.awayLineup;
+  const playerPosInfo = lineup.find(p => p.playerId === player.id);
+  const position = playerPosInfo?.position || '';
+  const zone = gameState.ball.zone;
+  
+  let weights = { PASS: 0.5, DRIBBLE: 0.4, SHOOT: 0.05, THROUGH_BALL: 0.05, CROSS: 0.05 };
 
-  // Ratings initialisieren (nur aufgestellte Spieler)
-  const playerRatings = initRatings([...home, ...away], state?.playerRatings);
+  // 1. Grund-Tendenzen basierend auf der Position
+  if (['ST', 'MS', 'HS'].includes(position)) weights = { PASS: 0.2, DRIBBLE: 0.1, SHOOT: 0.6, THROUGH_BALL: 0.1, CROSS: 0 };
+  else if (['LA', 'RA', 'LM', 'RM'].includes(position)) weights = { PASS: 0.3, DRIBBLE: 0.3, SHOOT: 0.1, THROUGH_BALL: 0.1, CROSS: 0.2 };
+  else if (['ZOM', 'ZM'].includes(position)) weights = { PASS: 0.5, DRIBBLE: 0.2, SHOOT: 0.1, THROUGH_BALL: 0.2, CROSS: 0 };
+  else if (['IV', 'LV', 'RV', 'ZDM'].includes(position)) weights = { PASS: 0.8, DRIBBLE: 0.2, SHOOT: 0, THROUGH_BALL: 0, CROSS: 0 };
+  else if (['TW'].includes(position)) return 'PASS';
 
-  // Beim allerersten Tick: Kickoff-Event erzeugen
-  if (!state || !state.events || state.events.length === 0) {
-    return getKickoffState(
-      home, away, homeTeam, awayTeam,
-      {
-        minute:           0,
-        possession:       null,
-        playerWithBall:   null,
-        ballZone:         null,
-        events:           [],
-        score:            { home: 0, away: 0 },
-        justWonDuel:      false,
-        attackTicks:      0,
-        playerRatings,
-        ratingEventsBuffer: [],
-        pendingAction:    null
-      }
-    );
+  // 2. Einfluss der Team-Taktik
+  const isHomeTeam = player.teamId === gameState.homeTeam.id;
+  const tactics = isHomeTeam ? gameState.homeTeamTactics : gameState.awayTeamTactics;
+  
+  if (tactics.passStyle === 'riskant') {
+    weights.THROUGH_BALL *= 2.0;
+    weights.PASS *= 0.5;
+  } else if (tactics.passStyle === 'sicher') {
+    weights.PASS *= 2.0;
+    weights.THROUGH_BALL = 0;
+    weights.DRIBBLE *= 0.5;
   }
 
-  // --- Ablauf eines normalen Simulations-Ticks ---
-  const isHome    = state.possession === "home";
-  const ballTeam  = isHome ? "home" : "away";
-  const oppTeam   = isHome ? "away" : "home";
-  const poss      = isHome ? home : away;
-  const opp       = isHome ? away : home;
-  const { rel: curRel } = parseZone(state.ballZone);
-  const currentMin = (state.minute || 0) + 90 / 120;
-
-  let nextPoss   = state.possession;
-  let nextPlayer = state.playerWithBall;
-  let nextZone   = state.ballZone;
-  let nextScore  = { ...state.score };
-  let text       = "";
-
-  const tickDeltas = {};
-
-  // Spielerobjekt aus playerWithBall-ID holen (falls aktuell nur ID gespeichert)
-  if (typeof nextPlayer === "string") {
-    nextPlayer = poss.find(p => p.id === nextPlayer) || poss[0];
+  // 3. Zonen-Einfluss
+  const isAttackingZone = (isHomeTeam && zone === 'AWAY_ATTACK') || (!isHomeTeam && zone === 'HOME_DEFENSE');
+  if (isAttackingZone) {
+    weights.SHOOT *= 2.0;
+    weights.CROSS *= 2.0;
   }
-
-  // Angreifer bestimmen (möglichst den aktuellen Ballführer)
-  let attacker = poss.find(p => p.id === nextPlayer.id) || poss[0];
-
-  // Verteidiger bestimmen (aus gegnerischer Spiegelzone wählen, sonst Zufall)
-  const defZone = parseZone(opponentZone(state.ballZone)).rel;
-  let defList = getPlayersByZone(opp.filter(p => p.position !== "TW"), defZone);
-  if (!defList.length) defList = opp.filter(p => p.position !== "TW");
-  let defender = defList.length ? defList[Math.floor(Math.random() * defList.length)] : attacker;
-
-  // Nächste Aktion festlegen (inkl. erzwungener Aktionen)
-  let action;
-  if (state.pendingAction) {
-    // Vorher gesetzte Aktion (z.B. nach Foul oder Dribbling) ausführen
-    action = state.pendingAction;
-  } else {
-    action = chooseAction(curRel);
-    if (state.justWonDuel && action === "duel") {
-      // Nach gewonnenem Zweikampf keinen erneuten Zweikampf, sondern Pass
-      action     = "pass";
-      nextPlayer = attacker;
-      nextZone   = buildZone(ballTeam, "midfield");
-    }
+  
+  // 4. Normalisierung & Auswahl
+  const totalWeight = Object.values(weights).reduce((sum, weight) => sum + weight, 0);
+  if (totalWeight === 0) return 'PASS';
+  for (const action in weights) { weights[action] /= totalWeight; }
+  
+  let cumulativeProbability = 0;
+  const randomNumber = Math.random();
+  for (const action in weights) {
+    cumulativeProbability += weights[action];
+    if (randomNumber <= cumulativeProbability) return action;
   }
-  // Status-Flags zurücksetzen
-  state.justWonDuel = false;
-  state.pendingAction = null;
+  return 'PASS';
+}
 
-  // Aktion ausführen
-  let result;
-  switch (action) {
-    case "pass":
-      result = passActions.simulatePass({
-        poss, attacker, defender, curRel, ballTeam, oppTeam, state, currentMin, tickDeltas, playerRatings
-      });
-      break;
-    case "dribble":
-      result = dribbleActions.simulateDribble({
-        poss, attacker, defender, opp, curRel, ballTeam, oppTeam, state, currentMin, tickDeltas, playerRatings
-      });
-      break;
-    case "killerPass":
-      result = killerPassActions.simulateKillerPass({
-        poss, attacker, defender, opp, curRel, ballTeam, oppTeam, state, currentMin, tickDeltas, playerRatings
-      });
-      break;
-    case "duel":
-      result = duelActions.simulateDuel({
-        poss, attacker, defender, opp, curRel, ballTeam, oppTeam, state, currentMin, tickDeltas, playerRatings,
-        homeTeam, awayTeam
-      });
-      break;
-    case "shoot":
-      result = shootActions.simulateShoot({
-        poss, attacker, defender, opp, curRel, ballTeam, oppTeam, state, currentMin, tickDeltas, playerRatings
-      });
-      break;
-    case "header":
-      result = headerActions.simulateHeader({
-        poss, attacker, defender, opp, curRel, ballTeam, oppTeam, state, currentMin, tickDeltas, playerRatings
-      });
-      break;
-    case "freekick":
-      result = freekickActions.simulateFreekick({
-        poss, attacker, defender, opp, curRel, ballTeam, oppTeam, state, currentMin, tickDeltas, playerRatings
-      });
-      break;
-    default:
-      // Keine besondere Aktion – Ball halten
-      result = {
-        nextPlayer: attacker,
-        nextZone: state.ballZone,
-        text: `${Math.round(currentMin)}' – Ball läuft in den eigenen Reihen.`
+/**
+ * Führt einen einzelnen, sauberen Spielzug aus.
+ */
+function executeTick(gameState) {
+  const context = gameState.ball.context || {};
+  if (context.type === 'REBOUND') return actions.scrambleForRebound(gameState);
+  if (context.type === 'FREE_KICK') {
+    const player = getPlayerById(gameState.players, gameState.ball.playerInPossessionId);
+    return actions.handleFreeKick(player, gameState);
+  }
+  
+  const playerInPossession = getPlayerById(gameState.players, gameState.ball.playerInPossessionId);
+  if (!playerInPossession) {
+    console.error(`Minute ${gameState.minute}: Kritischer Fehler! Kein Spieler im Ballbesitz.`);
+    const randomTeam = Math.random() < 0.5 ? gameState.homeTeam : gameState.awayTeam;
+    const randomPlayer = gameState.players.find(p => p.teamId === randomTeam.id);
+    gameState.ball.inPossessionOfTeam = randomTeam.id;
+    gameState.ball.playerInPossessionId = randomPlayer.id;
+    return gameState;
+  }
+  
+  const oldContext = context;
+  gameState.ball.context = {
+      type: 'OPEN_PLAY', priorityAction: null, lastAction: oldContext.lastAction,
+      lastActionPlayerId: oldContext.lastActionPlayerId, potentialAssistBy: oldContext.potentialAssistBy,
+      justBeatenPlayerId: null
+  };
+  
+  const actionToPerform = determineAction(playerInPossession, gameState);
+  let newGameState;
+
+  switch (actionToPerform) {
+    case 'SHOOT': newGameState = actions.shoot(playerInPossession, gameState); break;
+    case 'PASS': newGameState = actions.pass(playerInPossession, gameState); break;
+    case 'DRIBBLE': newGameState = actions.dribble(playerInPossession, gameState); break;
+    case 'CROSS': newGameState = actions.cross(playerInPossession, gameState); break;
+    case 'THROUGH_BALL': newGameState = actions.throughBall(playerInPossession, gameState); break;
+    default: 
+      const opponent = getOpponent(playerInPossession, gameState);
+      newGameState = { 
+          ...gameState, 
+          log: [...gameState.log, createLogEntry('PASS_FAIL', gameState, { player: playerInPossession, opponent })],
+          ball: { ...gameState.ball, inPossessionOfTeam: opponent.teamId, playerInPossessionId: opponent.id, context: {type: 'OPEN_PLAY'} }
       };
       break;
   }
-
-  // Ergebnis der Aktion verarbeiten
-  if (result.switchPossession) {
-    // Ballbesitz wechselt zur gegnerischen Mannschaft
-    nextPoss = oppTeam;
-  } else {
-    nextPoss = ballTeam;
-  }
-  if (result.goal) {
-    // Tor: Spielstand aktualisieren und Anstoß für das gegnerische Team
-    if (ballTeam === "home") {
-      nextScore.home++;
-    } else {
-      nextScore.away++;
-    }
-    nextPoss = oppTeam;
-    const mids = getPlayersByZone(opp, "midfield");
-    const kickPlayer = mids.length ? mids[Math.floor(Math.random() * mids.length)] : opp[0];
-    nextPlayer = kickPlayer;
-    nextZone   = buildZone(oppTeam, "midfield");
-  } else {
-    nextPlayer = result.nextPlayer || nextPlayer;
-    nextZone   = result.nextZone   || nextZone;
-  }
-  text = result.text || text;
-
-  // Flags für den nächsten Tick setzen
-  let nextJustWonDuel = false;
-  let nextPendingAction = null;
-  if (result.justWonDuel) {
-    nextJustWonDuel = true;
-  }
-  if (result.foul) {
-    nextPendingAction = "freekick";
-  }
-  if (result.actionOverride) {
-    nextPendingAction = result.actionOverride;
-  }
-
-  // Spielerbewertungen minimal Richtung Ausgangswert deklinieren
-  decayRatings(playerRatings);
-
-  // Bewertung-Events zwischenspeichern
-  const ratingEventsBuffer = appendRatingEvents(
-    state.ratingEventsBuffer,
-    tickDeltas,
-    Math.round(currentMin),
-    action
-  );
-
-  // Aktuelles Event protokollieren
-  const evt = {
-    minute:        Math.round(currentMin),
-    text,
-    type:          action,
-    possession:    nextPoss,
-    playerWithBall: safePlayerRef(nextPlayer)
-  };
-
-  // Neuen Spielstand zurückgeben
-  return {
-    minute:         currentMin,
-    possession:     nextPoss,
-    playerWithBall: nextPlayer, // Spielerobjekt (für nächsten Tick)
-    ballZone:       nextZone,
-    events:         [...state.events, evt],
-    score:          nextScore,
-    justWonDuel:    nextJustWonDuel,
-    attackTicks:    (nextPoss === state.possession && nextZone.endsWith("Attack"))
-                     ? (state.attackTicks || 0) + 1
-                     : 0,
-    playerRatings,
-    ratingEventsBuffer,
-    pendingAction:  nextPendingAction
-  };
+  return newGameState || gameState;
 }
 
-module.exports = { getNextGameState };
+/**
+ * Die Hauptfunktion, die eine komplette Spielsimulation ausführt.
+ */
+export function runSimulation(homeTeam, awayTeam, players, homeLineup, awayLineup) {
+  let gameState = initializeGameState(homeTeam, awayTeam, players, homeLineup, awayLineup);
+  
+  const firstHalfStoppage = Math.floor(Math.random() * 3) + 1;
+  const secondHalfStoppage = Math.floor(Math.random() * 5) + 1;
+  const gameDuration = 90 + firstHalfStoppage + secondHalfStoppage;
+  const halfTimeMinute = 45 + firstHalfStoppage;
+
+  while (gameState.minute < gameDuration) {
+    gameState.minute++;
+    if (gameState.ball.context?.type === 'GAME_END') break;
+
+    if (gameState.minute === halfTimeMinute) {
+        gameState.log.push(createLogEntry('HALF_TIME', gameState));
+        gameState.half = 2;
+        const secondHalfKickoffTeam = gameState.homeLineup.some(p => p.playerId === gameState.ball.playerInPossessionId) ? awayTeam : homeTeam;
+        const kickoffPlayer = players.find(p => p.teamId === secondHalfKickoffTeam.id && p.positionGroup === 'ATT') || players.find(p => p.teamId === secondHalfKickoffTeam.id);
+        
+        gameState.ball = {
+            inPossessionOfTeam: secondHalfKickoffTeam.id,
+            playerInPossessionId: kickoffPlayer.id,
+            zone: 'HOME_MIDFIELD',
+            context: { type: 'KICKOFF' }
+        };
+        gameState.log.push(createLogEntry('KICKOFF', gameState, { player: kickoffPlayer }));
+        continue;
+    }
+
+    const newState = executeTick(gameState);
+    if (!newState || !newState.ball) {
+        console.error(`FATALER FEHLER: Tick in Minute ${gameState.minute} hat einen ungültigen Zustand zurückgegeben.`, { lastValidState: gameState });
+        break; 
+    }
+    gameState = newState;
+  }
+
+  if (gameState) {
+    const finalRatings = {};
+    for (const playerId in gameState.playerRatings) {
+      const rawRating = gameState.playerRatings[playerId];
+      finalRatings[playerId] = parseFloat((rawRating || 6.0).toFixed(2));
+    }
+    gameState.playerRatings = finalRatings;
+    const lastPlayer = getPlayerById(gameState.players, gameState.ball.playerInPossessionId);
+    gameState.log.push(createLogEntry('GAME_END', gameState, { player: lastPlayer }));
+  }
+  
+  return gameState;
+}
