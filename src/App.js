@@ -1,87 +1,169 @@
-import React from 'react';
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
-import { AuthProvider, useAuth } from './context/AuthContext';
-import { ToastContainer } from 'react-toastify';
-import 'react-toastify/dist/ReactToastify.css';
-import './App.css';
+import React from "react";
+import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { Box, Container } from "@mui/material";
+import { AuthProvider, useAuth } from "./context/AuthContext";
+import Navbar from "./components/Navbar";
 
-import { ThemeProvider } from '@mui/material/styles';
-import CssBaseline from '@mui/material/CssBaseline';
-import { Container, Typography } from '@mui/material';
-import { LocalizationProvider } from '@mui/x-date-pickers';
-import { AdapterDateFns } from '@mui/x-date-pickers/AdapterDateFns';
-import { de } from 'date-fns/locale';
-import theme from './theme';
+// Pages
+import LoginPage from "./pages/LoginPage";
+import TeamPage from "./pages/TeamPage";
+import Taktikboard from "./pages/Taktikboard";
+import MatchHistoryPage from "./pages/MatchHistoryPage";
+import MatchResultPage from "./pages/MatchResultPage";
+import ChallengePage from "./pages/ChallengePage";
+import TransfermarktPage from "./pages/TransfermarktPage";
+import PendingActionsPage from "./pages/PendingActionsPage";
+import FinancePage from "./pages/FinancePage";
+import TransferHistoryPage from "./pages/TransferHistoryPage";
+import CompetitionsPage from "./pages/CompetitionsPage";   // Wettbewerbe
+import PlayerSearchPage from "./pages/PlayerSearchPage";   // Spielersuche
+import PlayerDetailPage from "./pages/PlayerDetailPage";   // Spieler-Details
+import AdminPage from "./pages/AdminPage";
 
-import Navbar from './components/Navbar';
-
-import LoginPage from './pages/LoginPage';
-import TeamPage from './pages/TeamPage';
-import Taktikboard from './pages/Taktikboard';
-import GamePage from './pages/GamePage';
-import AdminPage from './pages/AdminPage';
-import TransfermarktPage from './pages/TransfermarktPage';
-import ChallengePage from './pages/ChallengePage';
-import MatchHistoryPage from './pages/MatchHistoryPage';
-import MatchResultPage from './pages/MatchResultPage';
-import PendingActionsPage from './pages/PendingActionsPage';
-import PlayerDetailPage from './pages/PlayerDetailPage';
-
-
-function App() {
-  return (
-    <ThemeProvider theme={theme}>
-      <LocalizationProvider dateAdapter={AdapterDateFns} adapterLocale={de}>
-        <CssBaseline />
-        <AuthProvider>
-          <BrowserRouter>
-            <AppContent />
-          </BrowserRouter>
-          <ToastContainer theme="dark" autoClose={3000} hideProgressBar={false} />
-        </AuthProvider>
-      </LocalizationProvider>
-    </ThemeProvider>
-  );
+// ---------- Private Route ----------
+function PrivateRoute({ children }) {
+  const { user } = useAuth();
+  if (!user) return <Navigate to="/login" replace />;
+  return children;
 }
 
-// ---- Die eigentliche Routing-/Layout-Logik ----
-function AppContent() {
-  const { user, loading } = useAuth();
-
-  if (loading) {
-    return <Typography sx={{ textAlign: 'center', mt: 10 }}>Lade...</Typography>;
-  }
+// ---------- App Shell ----------
+function AppShell() {
+  const { user } = useAuth();
 
   return (
-    <>
+    <Box sx={{ minHeight: "100vh", bgcolor: "background.default" }}>
       {user && <Navbar />}
-      <Container sx={{ pb: 6 }}>
+      <Container maxWidth="lg" sx={{ pb: 6 }}>
         <Routes>
-          {user ? (
-            <>
-              <Route path="/" element={<TeamPage />} />
-              <Route path="/historie" element={<MatchHistoryPage />} />
-              <Route path="/taktik" element={<Taktikboard />} />
-              <Route path="/game/:gameId" element={<GamePage />} />
-              <Route path="/match/:gameId" element={<MatchResultPage />} />
-              <Route path="/transfermarkt" element={<TransfermarktPage />} />
-              <Route path="/challenge" element={<ChallengePage />} />
-              <Route path="/admin" element={<AdminPage />} />
-              <Route path="/login" element={<Navigate to="/" replace />} />
-              <Route path="*" element={<Navigate to="/" replace />} />
-              <Route path="/pending" element={<PendingActionsPage />} />
-              <Route path="/players/:playerId" element={<PlayerDetailPage />} />
-            </>
-          ) : (
-            <>
-              <Route path="/login" element={<LoginPage />} />
-              <Route path="*" element={<Navigate to="/login" replace />} />
-            </>
-          )}
+          {/* Public */}
+          <Route path="/login" element={<LoginPage />} />
+
+          {/* Private */}
+          <Route
+            path="/"
+            element={
+              <PrivateRoute>
+                <TeamPage />
+              </PrivateRoute>
+            }
+          />
+          <Route
+            path="/taktik"
+            element={
+              <PrivateRoute>
+                <Taktikboard />
+              </PrivateRoute>
+            }
+          />
+          <Route
+            path="/historie"
+            element={
+              <PrivateRoute>
+                <MatchHistoryPage />
+              </PrivateRoute>
+            }
+          />
+          <Route
+            path="/match/:gameId"
+            element={
+              <PrivateRoute>
+                <MatchResultPage />
+              </PrivateRoute>
+            }
+          />
+          <Route
+            path="/challenge"
+            element={
+              <PrivateRoute>
+                <ChallengePage />
+              </PrivateRoute>
+            }
+          />
+          <Route
+            path="/transfermarkt"
+            element={
+              <PrivateRoute>
+                <TransfermarktPage />
+              </PrivateRoute>
+            }
+          />
+          <Route
+            path="/pending"
+            element={
+              <PrivateRoute>
+                <PendingActionsPage />
+              </PrivateRoute>
+            }
+          />
+          <Route
+            path="/finanzen"
+            element={
+              <PrivateRoute>
+                <FinancePage />
+              </PrivateRoute>
+            }
+          />
+          <Route
+            path="/transferhistorie"
+            element={
+              <PrivateRoute>
+                <TransferHistoryPage />
+              </PrivateRoute>
+            }
+          />
+
+          {/* NEU */}
+          <Route
+            path="/competitions"
+            element={
+              <PrivateRoute>
+                <CompetitionsPage />
+              </PrivateRoute>
+            }
+          />
+          <Route
+            path="/players"
+            element={
+              <PrivateRoute>
+                <PlayerSearchPage />
+              </PrivateRoute>
+            }
+          />
+          <Route
+            path="/player/:playerId"
+            element={
+              <PrivateRoute>
+                <PlayerDetailPage />
+              </PrivateRoute>
+            }
+          />
+
+          {/* Admin */}
+          <Route
+            path="/admin"
+            element={
+              <PrivateRoute>
+                <AdminPage />
+              </PrivateRoute>
+            }
+          />
+
+          {/* Fallback */}
+          <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </Container>
-    </>
+    </Box>
   );
 }
 
-export default App;
+// ---------- Root ----------
+export default function App() {
+  return (
+    <AuthProvider>
+      <BrowserRouter>
+        <AppShell />
+      </BrowserRouter>
+    </AuthProvider>
+  );
+}
