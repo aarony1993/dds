@@ -54,6 +54,13 @@ export function createLogEntry(type, state, details = {}) {
     case 'REBOUND_LOSE': emoji = '🛡️'; color = '#2196F3'; break;
     case 'CROSS_SUCCESS': case 'THROUGH_BALL_SUCCESS': emoji = '✨'; color = '#AED581'; break;
     case 'CROSS_FAIL': case 'THROUGH_BALL_FAIL': emoji = '🛑'; color = '#FFC107'; break;
+    case 'YELLOW_CARD': emoji = '🟨'; color = '#FFEB3B'; break;
+    case 'SECOND_YELLOW_RED': emoji = '🟨🟥'; color = '#F44336'; break;
+    case 'RED_CARD': emoji = '🟥'; color = '#F44336'; break;
+    case 'INJURY': emoji = '🚑'; color = '#E57373'; break;
+    case 'SUBSTITUTION_INJURY': emoji = '🔁'; break;
+    case 'INJURY_NO_SUB': emoji = '❌'; color = '#E57373'; break;
+    case 'HALF_TIME': emoji = '⏸️'; break;
     default: emoji = '⚽'; break;
   }
 
