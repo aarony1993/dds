@@ -1,298 +1,414 @@
 // functions/simulation/engine.js
-import * as actions from './actions.js';
-import { getPlayerById, getOpponent } from './utils.js';
+// Läuft in Node ESM (Firebase Functions v2). Kein top-level await nötig.
+
+import {
+  pass,
+  dribble,
+  shoot,
+  cross,
+  throughBall,
+  foul,
+  handleFreeKick,
+  scrambleForRebound,
+  turnover,
+} from './actions.js';
+
+import {
+  sanitizePos,
+  positionKeyToGroup,
+  getTeamPlayer,
+  getPlayerById,
+} from './utils.js';
+
 import { createLogEntry } from './logger.js';
-import { SIM_TUNING } from './constants.js';
 
-/**
- * Initialisiert den zentralen Spielzustand (GameState) für ein neues Spiel.
- */
-function initializeGameState(homeTeam, awayTeam, players, homeLineup, awayLineup) {
-  const startingPlayerId =
-    homeLineup.find((pos) => pos.position === 'ZM')?.playerId ||
-    homeLineup.find((pos) => pos.positionGroup === 'MID')?.playerId ||
-    homeLineup[5].playerId;
+// -----------------------------------------------------------------------------
+// Simulations-Parameter (konservativ gewählt; an dein Projekt anpassbar)
+// -----------------------------------------------------------------------------
+const MAX_MINUTE = 96;         // harte Obergrenze
+const BASE_TICKS = 220;        // Zielanzahl "Aktionen" (nicht identisch mit Minuten)
+const OVERTIME_TICKS = 20;     // etwas Nachspielzeit/Spätphase
+const GK_IDENTITY = (p) => positionKeyToGroup(sanitizePos(p.position)) === 'TOR';
 
-  const startingPlayer = players.find((p) => p.id === startingPlayerId);
+// Aktionengewichte je Zone (vereinfachte Heuristik; "MUST_SHOOT" im Context hat Vorrang)
+const ACTION_WEIGHTS = {
+  HOME_DEFENSE: { PASS: 0.70, DRIBBLE: 0.18, LONG: 0.12 },
+  HOME_MIDFIELD: { PASS: 0.55, DRIBBLE: 0.30, THROUGH: 0.15 },
+  AWAY_MIDFIELD: { PASS: 0.55, DRIBBLE: 0.30, THROUGH: 0.15 },
+  AWAY_ATTACK: { PASS: 0.35, DRIBBLE: 0.35, CROSS: 0.15, SHOOT: 0.15 },
+};
 
-  const playerRatings = {};
+// -----------------------------------------------------------------------------
+// Robustheit: beliebige Eingabe in Array verwandeln
+// -----------------------------------------------------------------------------
+function normalizeToArray(v) {
+  if (Array.isArray(v)) return v;
+  if (!v) return [];
+  if (typeof v === 'object') return Object.values(v);
+  return [];
+}
+
+// Zufallsauswahl nach Gewicht
+function weightedPick(entries) {
+  // entries: Array<[key, weight]>
+  const total = entries.reduce((s, [, w]) => s + (w > 0 ? w : 0), 0);
+  if (total <= 0) return entries[0]?.[0];
+  let r = Math.random() * total;
+  for (const [k, w] of entries) {
+    if (w <= 0) continue;
+    r -= w;
+    if (r <= 0) return k;
+  }
+  return entries[entries.length - 1]?.[0];
+}
+
+// Startspieler für Kickoff: nimmt Stürmer, sonst beliebig
+function selectKickoffPlayer(teamId, playersArr) {
+  const att =
+    playersArr.find((p) => p.teamId === teamId && p.positionGroup === 'ATT') ||
+    playersArr.find((p) => p.teamId === teamId);
+  return att;
+}
+
+// Ableitung "isCompetitive" (Pflichtspiel vs. FS) – wird von actions.js abgefragt
+function deriveIsCompetitive(gameLike) {
+  const code = (gameLike?.competitionCategory || gameLike?.type || '').toUpperCase();
+  // alles außer Freundschaftsspiel (FS/FRIENDLY) als Pflichtspiel behandeln
+  return !(code === 'FS' || code === 'FRIENDLY');
+}
+
+// Team-Taktiken (werden im State gehalten; in Aktionen/Utils nutzbar)
+function extractTeamTactics(teamDoc) {
+  return {
+    defensiveLine: teamDoc?.tacticDefensiveLine || 'normal', // 'tief' | 'normal' | 'hoch'
+    passStyle: teamDoc?.tacticPassStyle || 'gemischt',       // 'sicher' | 'gemischt' | 'riskant'
+  };
+}
+
+// Set aus auf dem Feld befindlichen Spielern (Startelf)
+function startersFromLineup(lineupArr) {
+  const set = new Set();
+  (lineupArr || []).forEach((it) => {
+    if (it?.playerId) set.add(it.playerId);
+  });
+  return set;
+}
+
+// Ersatzbank = Teamspieler – Startelf
+function benchForTeam(teamId, playersArr, startersSet) {
+  return playersArr
+    .filter((p) => p.teamId === teamId && !startersSet.has(p.id))
+    .map((p) => ({ ...p }));
+}
+
+// Basis-PlayerStats initialisieren
+function blankStatsForPlayer(p) {
+  return {
+    minutes: 0,
+    rating: 6.0,
+    // Offensiv
+    shots: 0,
+    shotsOnTarget: 0,
+    goals: 0,
+    assists: 0,
+    passes: 0,
+    passesCompleted: 0,
+    crosses: 0,
+    crossesCompleted: 0,
+    throughBalls: 0,
+    throughBallsCompleted: 0,
+    dribbles: 0,
+    dribblesSucceeded: 0,
+    // Defensiv
+    tackles: 0,
+    tacklesSucceeded: 0,
+    interceptions: 0,
+    saves: 0,
+    // Disziplin
+    foulsCommitted: 0,
+    cardsYellow: 0,
+    yellowCards: 0, // Alias in manchen Logs
+    cardsRed: 0,
+    redCard: 0,     // Alias in manchen Logs
+  };
+}
+
+// Context neu auf "offenes Spiel"
+function openPlayContext() {
+  return { type: 'OPEN_PLAY', lastAction: null, lastActionPlayerId: null, potentialAssistBy: null };
+}
+
+// -----------------------------------------------------------------------------
+// State-Aufbau
+// -----------------------------------------------------------------------------
+function buildInitialState(homeTeam, awayTeam, players, homeLineup, awayLineup, gameLike = {}) {
+  const playersArr = normalizeToArray(players).map((p) => ({
+    ...p,
+    positionGroup: p.positionGroup || positionKeyToGroup(sanitizePos(p.position)),
+  }));
+
+  // Startelf-IDs
+  const startersHome = startersFromLineup(homeLineup);
+  const startersAway = startersFromLineup(awayLineup);
+
+  // Ersatzbänke
+  const homeBench = benchForTeam(homeTeam.id, playersArr, startersHome);
+  const awayBench = benchForTeam(awayTeam.id, playersArr, startersAway);
+
+  // PlayerStats/Ratings initialisieren nur für geladene Spieler
   const playerStats = {};
-
-  players.forEach((p) => {
+  const playerRatings = {};
+  playersArr.forEach((p) => {
+    playerStats[p.id] = blankStatsForPlayer(p);
     playerRatings[p.id] = 6.0;
-    playerStats[p.id] = {
-      shots: 0,
-      shotsOnTarget: 0,
-      goals: 0,
-      assists: 0,
-
-      passes: 0,
-      passesCompleted: 0,
-
-      dribbles: 0,
-      dribblesSucceeded: 0,
-
-      tackles: 0,
-      tacklesSucceeded: 0,
-
-      foulsCommitted: 0,
-      saves: 0,
-
-      crosses: 0,
-      crossesCompleted: 0,
-
-      throughBalls: 0,
-      throughBallsCompleted: 0,
-
-      interceptions: 0,
-    };
   });
 
-  return {
-    minute: 0,
-    half: 1,
+  // Individuelle Anweisungen aus Lineups (werden am Spieler-Objekt gespiegelt)
+  const instructionByPlayerId = {};
+  [...(homeLineup || []), ...(awayLineup || [])].forEach((slot) => {
+    if (slot?.playerId && slot?.instructions) {
+      instructionByPlayerId[slot.playerId] = slot.instructions;
+    }
+  });
+  playersArr.forEach((p) => {
+    if (instructionByPlayerId[p.id]) {
+      p.instructions = { ...(p.instructions || {}), ...instructionByPlayerId[p.id] };
+    }
+  });
+
+  // Taktik am Team
+  const homeTactics = extractTeamTactics(homeTeam);
+  const awayTactics = extractTeamTactics(awayTeam);
+
+  // Kickoff: Home bekommt den Anstoß (kannst du randomisieren, wenn du willst)
+  const kickoffTeamId = homeTeam.id;
+  const kickoffPlayer =
+    selectKickoffPlayer(kickoffTeamId, playersArr) ||
+    playersArr.find((p) => p.teamId === kickoffTeamId);
+
+  // Grund-Log
+  const log = [];
+  if (kickoffPlayer) {
+    log.push(createLogEntry('KICKOFF', {}, { player: kickoffPlayer }));
+  }
+
+  // Engine-State
+  const state = {
+    minute: 1,
+    tick: 0,
+    maxTicks: BASE_TICKS + Math.floor(Math.random() * OVERTIME_TICKS),
+
+    // Teams & Kader
+    homeTeam: { ...homeTeam, tactics: homeTactics },
+    awayTeam: { ...awayTeam, tactics: awayTactics },
+    players: playersArr,
+
+    // Startelf-Struktur wie in deiner DB (wird für Positionen genutzt)
+    homeLineup: JSON.parse(JSON.stringify(homeLineup || [])),
+    awayLineup: JSON.parse(JSON.stringify(awayLineup || [])),
+    homeBench,
+    awayBench,
+
+    // Spielrelevante Sammlungen
+    playerStats,
+    playerRatings,
+    log,
+
+    // Disziplin/Verfügbarkeit
+    sentOff: {},       // playerId -> true
+    injuredOff: {},    // playerId -> true
+    subsLeft: { [homeTeam.id]: 5, [awayTeam.id]: 5 },
+
+    // Ergebnis
     homeScore: 0,
     awayScore: 0,
 
-    homeTeam,
-    awayTeam,
-    players,
-    homeLineup,
-    awayLineup,
-
-    playerRatings,
-    playerStats,
-
-    // Taktiken in den GameState legen
-    homeTeamTactics: {
-      defensiveLine: homeTeam.tacticDefensiveLine || 'normal',
-      passStyle: homeTeam.tacticPassStyle || 'gemischt',
-    },
-    awayTeamTactics: {
-      defensiveLine: awayTeam.tacticDefensiveLine || 'normal',
-      passStyle: awayTeam.tacticPassStyle || 'gemischt',
-    },
-
+    // Ball/Zonen
     ball: {
-      inPossessionOfTeam: homeTeam.id,
-      playerInPossessionId: startingPlayer.id,
-      zone: 'HOME_MIDFIELD',
-      context: { type: 'OPEN_PLAY' },
+      inPossessionOfTeam: kickoffTeamId,
+      playerInPossessionId: kickoffPlayer?.id || null,
+      zone: 'HOME_MIDFIELD', // neutral Startzone
+      context: { type: 'KICKOFF' },
     },
 
-    log: [
-      createLogEntry('GAME_START', { homeTeam, awayTeam, minute: 0 }, { player: startingPlayer }),
-    ],
+    // Meta
+    isCompetitive: deriveIsCompetitive(gameLike),
+
+    // Post-Match (wird von actions.js befüllt)
+    postMatch: { suspensions: [], yellowIncrements: {}, injuries: [] },
   };
+
+  return state;
 }
 
-/**
- * KI-Logik: nächste Aktion bestimmen.
- */
-function determineAction(player, gameState) {
-  const context = gameState.ball.context || {};
-  if (context.priorityAction) return context.priorityAction;
-  if (context.type === 'FREE_KICK') return 'HANDLE_FREE_KICK';
-  if (context.type === 'REBOUND') return 'SCRAMBLE_FOR_REBOUND';
-
-  const lineup = player.teamId === gameState.homeTeam.id ? gameState.homeLineup : gameState.awayLineup;
-  const playerPosInfo = lineup.find((p) => p.playerId === player.id);
-  const position = playerPosInfo?.position || '';
-  const zone = gameState.ball.zone;
-
-  let weights = { PASS: 0.5, DRIBBLE: 0.4, SHOOT: 0.05, THROUGH_BALL: 0.05, CROSS: 0.05 };
-
-  // 1) Grundtendenz je Position
-  if (['ST', 'MS', 'HS'].includes(position))
-    weights = { PASS: 0.2, DRIBBLE: 0.1, SHOOT: 0.6, THROUGH_BALL: 0.1, CROSS: 0 };
-  else if (['LA', 'RA', 'LM', 'RM'].includes(position))
-    weights = { PASS: 0.3, DRIBBLE: 0.3, SHOOT: 0.1, THROUGH_BALL: 0.1, CROSS: 0.2 };
-  else if (['ZOM', 'ZM'].includes(position))
-    weights = { PASS: 0.5, DRIBBLE: 0.2, SHOOT: 0.1, THROUGH_BALL: 0.2, CROSS: 0 };
-  else if (['IV', 'LV', 'RV', 'ZDM'].includes(position))
-    weights = { PASS: 0.8, DRIBBLE: 0.2, SHOOT: 0, THROUGH_BALL: 0, CROSS: 0 };
-  else if (position === 'TW') return 'PASS';
-
-  // 2) Tak­tik­einfluss
-  const isHomeTeam = player.teamId === gameState.homeTeam.id;
-  const tactics = isHomeTeam ? gameState.homeTeamTactics : gameState.awayTeamTactics;
-
-  if (tactics.passStyle === 'riskant') {
-    weights.THROUGH_BALL *= 2.0;
-    weights.PASS *= 0.5;
-  } else if (tactics.passStyle === 'sicher') {
-    weights.PASS *= 2.0;
-    weights.THROUGH_BALL = 0;
-    weights.DRIBBLE *= 0.5;
-  }
-
-  // 3) Zonen-Einfluss
-  const isAttackingZone =
-    (isHomeTeam && zone === 'AWAY_ATTACK') || (!isHomeTeam && zone === 'HOME_DEFENSE');
-  if (isAttackingZone) {
-    weights.SHOOT *= 2.0;
-    weights.CROSS *= 2.0;
-  }
-
-  // 4) Neu: Multiplikatoren aus SIM_TUNING anwenden
-  const mult = (SIM_TUNING && SIM_TUNING.WEIGHT_MULT) || {};
-  weights.PASS *= mult.PASS ?? 1;
-  weights.DRIBBLE *= mult.DRIBBLE ?? 1;
-  weights.SHOOT *= mult.SHOOT ?? 1;
-  weights.CROSS *= mult.CROSS ?? 1;
-  weights.THROUGH_BALL *= mult.THROUGH_BALL ?? 1;
-
-  // 5) Normalisieren & auswählen
-  const totalWeight = Object.values(weights).reduce((s, w) => s + w, 0);
-  if (totalWeight <= 0) return 'PASS';
-
-  let r = Math.random() * totalWeight;
-  for (const key of Object.keys(weights)) {
-    r -= weights[key];
-    if (r <= 0) return key;
-  }
-  return 'PASS';
+// -----------------------------------------------------------------------------
+// Hilfsfunktionen: Feldspieler/GK-Verfügbarkeit im Spiel
+// -----------------------------------------------------------------------------
+function isAvailableOnPitch(state, playerId) {
+  return !(state.sentOff[playerId] || state.injuredOff[playerId]);
 }
 
-/**
- * Einen einzelnen, sauberen Spielzug ausführen.
- */
-function executeTick(gameState) {
-  const context = gameState.ball.context || {};
+function currentPossessor(state) {
+  const pid = state.ball.playerInPossessionId;
+  if (!pid) return null;
+  const p = getPlayerById(state.players, pid);
+  if (!p) return null;
+  if (!isAvailableOnPitch(state, pid)) return null;
+  return p;
+}
 
-  // Spezialkontexte zuerst behandeln
-  if (context.type === 'REBOUND') return actions.scrambleForRebound(gameState);
-  if (context.type === 'FREE_KICK') {
-    const player = getPlayerById(gameState.players, gameState.ball.playerInPossessionId);
-    return actions.handleFreeKick(player, gameState);
+function switchPossessionToTeamAnchor(state, teamId) {
+  // Wenn kein konkreter Spieler greifbar ist (z. B. nach Lose/Turnover),
+  // nimm einen passenden "Anker" (IV/DM in Abwehrzone, ZM im Mittelfeld, ST/HS/MS im Angriff).
+  let anchor =
+    state.players.find((p) => p.teamId === teamId && p.positionGroup === 'MID') ||
+    state.players.find((p) => p.teamId === teamId && p.positionGroup === 'DEF') ||
+    state.players.find((p) => p.teamId === teamId);
+  if (anchor) {
+    state.ball.inPossessionOfTeam = teamId;
+    state.ball.playerInPossessionId = anchor.id;
+  } else {
+    // Fallback (extrem unwahrscheinlich)
+    state.ball.inPossessionOfTeam = teamId;
+    state.ball.playerInPossessionId = null;
+  }
+  state.ball.context = openPlayContext();
+}
+
+// -----------------------------------------------------------------------------
+// Aktionswahl (ohne MUST_SHOOT / Standardsituationen)
+// -----------------------------------------------------------------------------
+function pickActionForState(state, player) {
+  // Freistoß?
+  if (state.ball.context?.type === 'FREE_KICK') {
+    return 'FREE_KICK';
+  }
+  // Rebound-Getümmel
+  if (state.ball.context?.type === 'REBOUND') {
+    return 'REBOUND';
+  }
+  // Vorgabe aus Context (z. B. DRIBBLE_SUCCESS -> MUST_SHOOT in Attack)
+  if (state.ball.context?.priorityAction === 'MUST_SHOOT') {
+    return 'SHOOT';
   }
 
-  const playerInPossession = getPlayerById(
-    gameState.players,
-    gameState.ball.playerInPossessionId
+  const zone = state.ball.zone || 'HOME_MIDFIELD';
+  const w = ACTION_WEIGHTS[zone] || ACTION_WEIGHTS.HOME_MIDFIELD;
+
+  // Torhüter: sichere, kurze Pässe bevorzugen
+  if (GK_IDENTITY(player)) {
+    return 'PASS';
+  }
+
+  // einfache gewichtete Wahl
+  const entries = Object.entries(w);
+  const key = weightedPick(entries);
+  switch (key) {
+    case 'PASS': return 'PASS';
+    case 'DRIBBLE': return 'DRIBBLE';
+    case 'THROUGH': return 'THROUGH_BALL';
+    case 'CROSS': return 'CROSS';
+    case 'LONG': return 'PASS'; // Langpass als PASS (die Richtungs-/Zonenlogik steckt in findBestPassRecipient/utils)
+    case 'SHOOT': return 'SHOOT';
+    default: return 'PASS';
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Ein Simulations-Tick
+// -----------------------------------------------------------------------------
+function executeTick(state) {
+  // Tick/Minute fortschreiben
+  state.tick += 1;
+  if (state.tick % 2 === 0 && state.minute < MAX_MINUTE) {
+    state.minute += 1;
+  }
+
+  const player = currentPossessor(state);
+  if (!player) {
+    // Niemand in Ballbesitz -> Ball an Team-Anker
+    switchPossessionToTeamAnchor(state, state.ball.inPossessionOfTeam);
+    return state;
+  }
+
+  // Spieler-Minuten mitzählen (grob pro Tick; optional: nur jede x Ticks)
+  state.playerStats[player.id].minutes = Math.min(
+    MAX_MINUTE,
+    (state.playerStats[player.id].minutes || 0) + 1
   );
 
-  if (!playerInPossession) {
-    // Fallback: Ballbesitz neu vergeben (extrem selten)
-    const randomTeam = Math.random() < 0.5 ? gameState.homeTeam : gameState.awayTeam;
-    const randomPlayer = gameState.players.find((p) => p.teamId === randomTeam.id);
-    gameState.ball.inPossessionOfTeam = randomTeam.id;
-    gameState.ball.playerInPossessionId = randomPlayer.id;
-    return gameState;
-  }
+  const action = pickActionForState(state, player);
 
-  // Kontext zurück auf Open Play
-  const oldContext = context;
-  gameState.ball.context = {
-    type: 'OPEN_PLAY',
-    priorityAction: null,
-    lastAction: oldContext.lastAction,
-    lastActionPlayerId: oldContext.lastActionPlayerId,
-    potentialAssistBy: oldContext.potentialAssistBy,
-    justBeatenPlayerId: null,
-  };
-
-  const actionToPerform = determineAction(playerInPossession, gameState);
-
-  switch (actionToPerform) {
-    case 'SHOOT':
-      return actions.shoot(playerInPossession, gameState);
-    case 'PASS':
-      return actions.pass(playerInPossession, gameState);
-    case 'DRIBBLE':
-      return actions.dribble(playerInPossession, gameState);
-    case 'CROSS':
-      return actions.cross(playerInPossession, gameState);
-    case 'THROUGH_BALL':
-      return actions.throughBall(playerInPossession, gameState);
+  // Aktion ausführen
+  switch (action) {
+    case 'FREE_KICK': {
+      return handleFreeKick(player, state);
+    }
+    case 'REBOUND': {
+      return scrambleForRebound(state);
+    }
+    case 'PASS': {
+      return pass(player, state);
+    }
+    case 'DRIBBLE': {
+      return dribble(player, state);
+    }
+    case 'THROUGH_BALL': {
+      return throughBall(player, state);
+    }
+    case 'CROSS': {
+      return cross(player, state);
+    }
+    case 'SHOOT': {
+      return shoot(player, state);
+    }
     default: {
-      // Fallback: Ballverlust
-      const opponent = getOpponent(playerInPossession, gameState);
-      return {
-        ...gameState,
-        log: [
-          ...gameState.log,
-          createLogEntry('PASS_FAIL', gameState, { player: playerInPossession, opponent }),
-        ],
-        ball: {
-          ...gameState.ball,
-          inPossessionOfTeam: opponent.teamId,
-          playerInPossessionId: opponent.id,
-          context: { type: 'OPEN_PLAY' },
-        },
-      };
+      // Fallback
+      return turnover(player, state);
     }
   }
 }
 
-/**
- * Vollständige Spielsimulation.
- */
-export function runSimulation(homeTeam, awayTeam, players, homeLineup, awayLineup) {
-  let gameState = initializeGameState(homeTeam, awayTeam, players, homeLineup, awayLineup);
+// -----------------------------------------------------------------------------
+// Endbedingungen & Ergebnis
+// -----------------------------------------------------------------------------
+function isFinished(state) {
+  if (state.tick >= state.maxTicks) return true;
+  if (state.minute >= MAX_MINUTE) return true;
+  return false;
+}
 
-  // Nachspielzeiten
-  const firstHalfStoppage = Math.floor(Math.random() * 3) + 1;
-  const secondHalfStoppage = Math.floor(Math.random() * 5) + 1;
-  const gameDuration = 90 + firstHalfStoppage + secondHalfStoppage;
-  const halfTimeMinute = 45 + firstHalfStoppage;
+// Public API
+export function runSimulation(homeTeam, awayTeam, playersInput, homeLineup, awayLineup, gameLike = {}) {
+  const state = buildInitialState(homeTeam, awayTeam, playersInput, homeLineup, awayLineup, gameLike);
 
-  while (gameState.minute < gameDuration) {
-    gameState.minute += 1;
-    if (gameState.ball.context?.type === 'GAME_END') break;
+  // Sanity: Log einen Start-Event mit Teams
+  state.log.push(createLogEntry('MATCH_START', state, { homeTeam, awayTeam }));
 
-    // Halbzeit
-    if (gameState.minute === halfTimeMinute) {
-      gameState.log.push(createLogEntry('HALF_TIME', gameState));
-      gameState.half = 2;
-
-      const secondHalfKickoffTeam = gameState.homeLineup.some(
-        (p) => p.playerId === gameState.ball.playerInPossessionId
-      )
-        ? awayTeam
-        : homeTeam;
-
-      const kickoffPlayer =
-        gameState.players.find(
-          (p) => p.teamId === secondHalfKickoffTeam.id && p.positionGroup === 'ATT'
-        ) || gameState.players.find((p) => p.teamId === secondHalfKickoffTeam.id);
-
-      gameState.ball = {
-        inPossessionOfTeam: secondHalfKickoffTeam.id,
-        playerInPossessionId: kickoffPlayer.id,
-        zone: 'HOME_MIDFIELD',
-        context: { type: 'KICKOFF' },
-      };
-      gameState.log.push(createLogEntry('KICKOFF', gameState, { player: kickoffPlayer }));
-      continue;
-    }
-
-    // NEU: mehrere Mikro-Ticks pro Minute (APM)
-    const apm = Math.max(1, Math.round(SIM_TUNING?.ACTIONS_PER_MINUTE || 1));
-    // kleines „Jitter“, damit es natürlicher schwankt
-    const jitter = (Math.random() < 0.35 ? 1 : 0) - (Math.random() < 0.2 ? 1 : 0);
-    const microTicks = Math.max(1, apm + jitter);
-
-    for (let j = 0; j < microTicks; j++) {
-      const newState = executeTick(gameState);
-      if (!newState || !newState.ball) {
-        // harter Abbruch bei invalidem Zustand
-        break;
-      }
-      gameState = newState;
-      if (gameState.ball.context?.type === 'GAME_END') break;
-    }
+  // Hauptschleife
+  while (!isFinished(state)) {
+    executeTick(state);
   }
 
   // Abschluss
-  const finalRatings = {};
-  for (const playerId of Object.keys(gameState.playerRatings)) {
-    finalRatings[playerId] = parseFloat((gameState.playerRatings[playerId] || 6.0).toFixed(2));
-  }
-  gameState.playerRatings = finalRatings;
+  state.log.push(createLogEntry('MATCH_END', state, { homeScore: state.homeScore, awayScore: state.awayScore }));
 
-  const lastPlayer = getPlayerById(gameState.players, gameState.ball.playerInPossessionId);
-  gameState.log.push(createLogEntry('GAME_END', gameState, { player: lastPlayer }));
+  // Rückgabe in der Form, die index.js erwartet
+  return {
+    homeScore: state.homeScore,
+    awayScore: state.awayScore,
+    log: state.log,
+    playerRatings: state.playerRatings,
+    playerStats: state.playerStats,
 
-  return gameState;
+    // Für Debug/Review nützlich:
+    homeTeam: state.homeTeam,
+    awayTeam: state.awayTeam,
+    players: state.players,
+    homeLineup: state.homeLineup,
+    awayLineup: state.awayLineup,
+    postMatch: state.postMatch,
+  };
 }
+
+export default runSimulation;

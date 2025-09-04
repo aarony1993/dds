@@ -19,6 +19,11 @@ const db = admin.firestore();
 const auth = admin.auth();
 setGlobalOptions({ region: "europe-west3" });
 
+// Optional: Ignoriere undefined global (wir bereinigen trotzdem proaktiv).
+try {
+  db.settings({ ignoreUndefinedProperties: true });
+} catch { /* older SDKs may not support, safe to ignore */ }
+
 // ---------------------------------------------------------
 // Helper: Zahl normalisieren
 const toNumber = (x) => {
@@ -29,7 +34,6 @@ const toNumber = (x) => {
 // Helper: Budget/Balance per increment anpassen
 async function incrementTeamBalance(teamId, delta) {
   const ref = db.collection("teams").doc(teamId);
-  // Parallel budget und – falls vorhanden – balance korrigieren.
   await ref.set(
     {
       budget: admin.firestore.FieldValue.increment(delta),
@@ -49,6 +53,118 @@ async function addTransaction(teamId, tx) {
     type: tx.type || "transfer",
   });
   return ref.id;
+}
+
+// ---------------------------------------------------------
+// Firestore-Sanitizer (rekursiv)
+function sanitizeForFirestore(value) {
+  if (value === undefined) return undefined; // Aufrufender Code soll Feld entfernen, nicht als null schreiben
+  if (value === null) return null;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) return null;
+    return value;
+  }
+  if (typeof value === "string") {
+    // defensiv: Strings nicht explodieren lassen
+    return value.length > 20000 ? value.slice(0, 20000) : value;
+  }
+  if (Array.isArray(value)) {
+    const arr = value
+      .map((v) => sanitizeForFirestore(v))
+      .filter((v) => v !== undefined);
+    return arr;
+  }
+  if (value instanceof Date) return value;
+  if (typeof value === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      const sv = sanitizeForFirestore(v);
+      if (sv !== undefined) out[k] = sv;
+    }
+    return out;
+  }
+  return value;
+}
+
+// Sim-Log normalisieren: minute nie undefined, Felder bereinigen
+function normalizeSimulationLog(log) {
+  if (!Array.isArray(log)) return [];
+  return log.map((entry, idx) => {
+    const safeMinuteRaw =
+      entry?.minute === undefined || entry?.minute === null
+        ? 0
+        : Number(entry.minute);
+    const safeMinute = Number.isFinite(safeMinuteRaw) ? safeMinuteRaw : 0;
+
+    // bekannte Felder beibehalten, Rest in payload/meta
+    const { type, message, teamId, playerId, opponentId, zone, meta, payload, ...rest } = entry || {};
+    const packed = {
+      minute: safeMinute,
+      type: type || rest?.type || "INFO",
+      message: message ?? null,
+      teamId: teamId ?? null,
+      playerId: playerId ?? null,
+      opponentId: opponentId ?? null,
+      zone: zone ?? null,
+      meta: sanitizeForFirestore(meta ?? {}),
+      payload: sanitizeForFirestore({ ...rest, ...(payload ?? {}) }),
+      // kleiner Marker zur leichteren Fehlersuche:
+      _i: idx,
+    };
+    return sanitizeForFirestore(packed);
+  });
+}
+
+// Ratings: numerisch, keine undefined
+function normalizePlayerRatings(ratings) {
+  const out = {};
+  if (ratings && typeof ratings === "object") {
+    for (const [pid, val] of Object.entries(ratings)) {
+      out[pid] = toNumber(val);
+    }
+  }
+  return out;
+}
+
+// Stats: fehlende Zähler -> 0, alles bereinigen
+function normalizePlayerStats(stats) {
+  const out = {};
+  if (!stats || typeof stats !== "object") return out;
+  for (const [pid, s] of Object.entries(stats)) {
+    const ss = { ...(s || {}) };
+    // typische Zähler defensiv auf Zahl casten
+    const counters = [
+      "passes", "passesCompleted",
+      "dribbles", "dribblesSucceeded",
+      "shots", "shotsOnTarget", "goals", "assists",
+      "crosses", "crossesCompleted",
+      "throughBalls", "throughBallsCompleted",
+      "tackles", "tacklesSucceeded",
+      "interceptions", "saves",
+      "foulsCommitted", "foulsDrawn",
+      "yellowCards", "cardsYellow", "redCard", "cardsRed",
+    ];
+    for (const k of counters) {
+      ss[k] = toNumber(ss[k] ?? 0);
+    }
+    out[pid] = sanitizeForFirestore(ss);
+  }
+  return out;
+}
+
+// Lineup-Array absichern
+function normalizeLineup(arr) {
+  if (!Array.isArray(arr)) return [];
+  return arr
+    .map((x) =>
+      sanitizeForFirestore({
+        positionKey: x?.positionKey || x?.position || null,
+        position: x?.position || null,
+        playerId: x?.playerId || null,
+        instructions: x?.instructions || {},
+      })
+    )
+    .filter((x) => x && x.playerId);
 }
 
 // ========================================================================================
@@ -80,8 +196,8 @@ export const startSimulation = onDocumentUpdated("games/{gameId}", async (event)
     const homeTeam = { id: homeTeamDoc.id, ...homeTeamDoc.data() };
     const awayTeam = { id: awayTeamDoc.id, ...awayTeamDoc.data() };
 
-    const homeLineup = homeTeam.defaultFormation || [];
-    const awayLineup = awayTeam.defaultFormation || [];
+    const homeLineup = normalizeLineup(homeTeam.defaultFormation || []);
+    const awayLineup = normalizeLineup(awayTeam.defaultFormation || []);
     if (homeLineup.length < 11 || awayLineup.length < 11) {
       throw new Error("Aufstellungen unvollständig.");
     }
@@ -104,20 +220,29 @@ export const startSimulation = onDocumentUpdated("games/{gameId}", async (event)
       awayLineup
     );
 
-    await gameRef.update({
+    // --- Persistente Daten sicher normalisieren ---
+    const safeLog = normalizeSimulationLog(finalGameState?.log || []);
+    const safeRatings = normalizePlayerRatings(finalGameState?.playerRatings || {});
+    const safeStats = normalizePlayerStats(finalGameState?.playerStats || {});
+    const safeHomeLineup = normalizeLineup(homeLineup);
+    const safeAwayLineup = normalizeLineup(awayLineup);
+
+    const payload = sanitizeForFirestore({
       status: "finished",
-      homeScore: finalGameState.homeScore,
-      awayScore: finalGameState.awayScore,
-      simulationLog: finalGameState.log,
-      playerRatings: finalGameState.playerRatings,
-      playerStats: finalGameState.playerStats,
+      homeScore: toNumber(finalGameState?.homeScore),
+      awayScore: toNumber(finalGameState?.awayScore),
+      simulationLog: safeLog,
+      playerRatings: safeRatings,
+      playerStats: safeStats,
       homeFormationKey: homeTeam.formationKey || "Unbekannt",
       awayFormationKey: awayTeam.formationKey || "Unbekannt",
-      lineupHome: homeLineup,
-      lineupAway: awayLineup,
+      lineupHome: safeHomeLineup,
+      lineupAway: safeAwayLineup,
       finishedAt: admin.firestore.FieldValue.serverTimestamp(),
       simulationMode: "batch",
     });
+
+    await gameRef.update(payload);
 
     logger.info(`✅ Ergebnis für Spiel ${gameId} gespeichert.`);
   } catch (error) {
