@@ -1,101 +1,21 @@
-// functions/simulation/actions.js
 import {
   getPositionalBonus,
   calculateSuccess,
   getOpponent,
   getTeamPlayer,
-  applyRatingDelta,
   getPlayerById,
   sanitizePos,
   positionKeyToGroup,
+  ensurePlayerStats,
+  oneStepForwardZone,
+  twoStepsForwardZone,
+  isCompetitive,
 } from './utils.js';
 import { createLogEntry } from './logger.js';
-import { RATING_DELTAS, DISCIPLINE, INJURIES } from './constants.js';
+import { RATING_DELTAS, DISCIPLINE, INJURIES, ZONES } from './constants.js';
+import { findBestPassRecipient, computeZoneAfterPass } from './ai/findBestPassRecipient.js';
 
-import {
-  findBestPassRecipient as aiFindBestPassRecipient,
-  applyTouchState as aiApplyTouchState,
-  computeZoneAfterPass,
-} from './ai/findBestPassRecipient.js';
-
-/* ---------------------------------------------------
-   Interne Normalisierungen / Helfer
---------------------------------------------------- */
-
-const CROSS_FAIL_DISTR = {
-  DEF_INTERCEPT: 0.55,        // Abwehr fängt ab
-  GK_CLAIM: 0.25,             // Keeper pflückt/klärt
-  OVERHIT_GOAL_KICK: 0.20,    // ins Aus -> Abstoß
-};
-
-function normalizeGroupLabel(raw) {
-  const v = String(raw || '').trim().toUpperCase();
-  if (['DEF', 'ABW', 'D', 'ABWEHR', 'VERTEIDIGER'].includes(v)) return 'DEF';
-  if (['MID', 'MIT', 'M', 'MF', 'MITTELFELD'].includes(v)) return 'MID';
-  if (['ATT', 'ANG', 'A', 'ST', 'ANGRIFF', 'STURM'].includes(v)) return 'ATT';
-  if (['TOR', 'GK', 'TW', 'GOALKEEPER', 'TORWART'].includes(v)) return 'TOR';
-  return v || '';
-}
-
-function groupOf(p) {
-  const pg = normalizeGroupLabel(p?.positionGroup);
-  if (pg === 'DEF' || pg === 'MID' || pg === 'ATT' || pg === 'TOR') return pg;
-  const pos = sanitizePos(p?.position);
-  const mapped = positionKeyToGroup(pos);
-  return normalizeGroupLabel(mapped);
-}
-function isGK(p) { return groupOf(p) === 'TOR'; }
-
-function onPitchIds(state) {
-  return new Set([
-    ...state.homeLineup.map(l => l.playerId),
-    ...state.awayLineup.map(l => l.playerId),
-  ]);
-}
-
-function chooseInterceptionOpponent(passer, state) {
-  const oppTeamId = (passer.teamId === state.homeTeam.id) ? state.awayTeam.id : state.homeTeam.id;
-  const on = onPitchIds(state);
-  const opp = state.players.filter(p => p.teamId === oppTeamId && on.has(p.id) && !state.sentOff[p.id] && !state.injuredOff[p.id]);
-  const fieldOpp = opp.filter(p => groupOf(p) !== 'TOR');
-  const pool = fieldOpp.length ? fieldOpp : opp;
-  return pool[Math.floor(Math.random() * pool.length)];
-}
-
-function pickOpponentForDuel(player, state) {
-  const oppTeamId = (player.teamId === state.homeTeam.id) ? state.awayTeam.id : state.homeTeam.id;
-  const on = onPitchIds(state);
-  const opp = state.players.filter(p => p.teamId === oppTeamId && on.has(p.id) && !state.sentOff[p.id] && !state.injuredOff[p.id]);
-  const def = opp.filter(p => groupOf(p) === 'DEF');
-  const mid = opp.filter(p => groupOf(p) === 'MID');
-  const att = opp.filter(p => groupOf(p) === 'ATT');
-  const gk  = opp.filter(p => groupOf(p) === 'TOR');
-
-  const zone = state.ball.zone;
-  const isHome = player.teamId === state.homeTeam.id;
-  const inAttThird = (isHome && zone === 'AWAY_ATTACK') || (!isHome && zone === 'HOME_DEFENSE');
-  const inMid = (zone === 'HOME_MIDFIELD' || zone === 'AWAY_MIDFIELD');
-
-  function pick(pools, weights) {
-    const total = weights.reduce((s,w)=>s+w,0) || 1;
-    let r = Math.random() * total;
-    for (let i=0;i<pools.length;i++){
-      r -= weights[i];
-      if (r<=0 && pools[i].length) return pools[i][Math.floor(Math.random()*pools[i].length)];
-    }
-    const flat = [].concat(...pools.filter(a=>a.length));
-    return flat[Math.floor(Math.random()*flat.length)] || opp[0];
-  }
-
-  if (inAttThird) return pick([def, mid, att, gk], [0.60, 0.30, 0.08, 0.02]);
-  if (inMid)      return pick([def, mid, att, gk], [0.25, 0.60, 0.15, 0.00]);
-                   return pick([def, mid, att, gk], [0.10, 0.45, 0.45, 0.00]);
-}
-
-/* ---------------------------------------------------
-   Clone-Helper & Regelflags
---------------------------------------------------- */
-
+// ----- Clone-Helper -----
 function cloneState(state) {
   return {
     ...state,
@@ -111,21 +31,15 @@ function cloneState(state) {
     sentOff: { ...(state.sentOff || {}) },
     injuredOff: { ...(state.injuredOff || {}) },
     postMatch: JSON.parse(JSON.stringify(state.postMatch || { suspensions: [], yellowIncrements: {}, injuries: [] })),
-    meta: state.meta ? { ...state.meta } : { consecutiveTouches: {}, lastPassFrom: null, lastReceiver: null },
   };
 }
 
-function isCompetitive(state) { return !!(state?.isCompetitive); }
-
-/* ---------------------------------------------------
-   Karten & Verletzungen
---------------------------------------------------- */
-
+// ----- Karten/Verletzungen -----
 function maybeBookCard(fouler, state) {
   if (!isCompetitive(state) && !DISCIPLINE.ENABLE_IN_FRIENDLIES) return state;
 
   const newState = cloneState(state);
-  const ps = newState.playerStats[fouler.id];
+  const ps = ensurePlayerStats(newState.playerStats, fouler.id);
 
   const alreadyYellow = (ps.yellowCards || ps.cardsYellow || 0) > 0;
   const giveStraightRed = Math.random() < (DISCIPLINE.STRAIGHT_RED_PROB || 0);
@@ -134,7 +48,7 @@ function maybeBookCard(fouler, state) {
     ps.redCard = (ps.redCard || 0) + 1;
     newState.sentOff[fouler.id] = true;
     newState.postMatch.suspensions.push({ playerId: fouler.id, matches: DISCIPLINE.SUSPENSION_MATCHES_RED || 2, reason: 'RED' });
-    newState.log.push(createLogEntry('RED_CARD', newState, { player: fouler }));
+    newState.log.push(createLogEntry('RED_CARD', newState, { playerId: fouler.id }));
     return newState;
   }
 
@@ -143,13 +57,13 @@ function maybeBookCard(fouler, state) {
     ps.cardsYellow = (ps.cardsYellow || 0) + 1;
     ps.yellowCards = (ps.yellowCards || 0) + 1;
     newState.postMatch.yellowIncrements[fouler.id] = (newState.postMatch.yellowIncrements[fouler.id] || 0) + 1;
-    newState.log.push(createLogEntry('YELLOW_CARD', newState, { player: fouler }));
+    newState.log.push(createLogEntry('YELLOW_CARD', newState, { playerId: fouler.id }));
 
     if (alreadyYellow && DISCIPLINE.SECOND_YELLOW_RED) {
       ps.cardsRed = (ps.cardsRed || 0) + 1;
       ps.redCard = (ps.redCard || 0) + 1;
       newState.sentOff[fouler.id] = true;
-      newState.log.push(createLogEntry('SECOND_YELLOW_RED', newState, { player: fouler }));
+      newState.log.push(createLogEntry('SECOND_YELLOW_RED', newState, { playerId: fouler.id }));
       newState.postMatch.suspensions.push({ playerId: fouler.id, matches: DISCIPLINE.SUSPENSION_MATCHES_SECOND_YELLOW || 1, reason: 'SECOND_YELLOW' });
     }
   }
@@ -188,7 +102,7 @@ function substituteForInjury(player, state) {
   newState.injuredOff[player.id] = true;
 
   if (subsLeft <= 0 || !bench || bench.length === 0) {
-    newState.log.push(createLogEntry('INJURY_NO_SUB', newState, { player }));
+    newState.log.push(createLogEntry('INJURY_NO_SUB', newState, { playerId: player.id }));
     return newState;
   }
 
@@ -202,7 +116,7 @@ function substituteForInjury(player, state) {
   const slot = lineup.find(l => l.playerId === player.id);
   if (slot) slot.playerId = sub.id;
 
-  newState.log.push(createLogEntry('SUBSTITUTION_INJURY', newState, { playerOut: player, playerIn: sub }));
+  newState.log.push(createLogEntry('SUBSTITUTION_INJURY', newState, { outId: player.id, inId: sub.id }));
 
   if (newState.ball.playerInPossessionId === player.id) {
     newState.ball.playerInPossessionId = sub.id;
@@ -213,7 +127,6 @@ function substituteForInjury(player, state) {
 
 function maybeInjuryOnEvent(victim, state, kind) {
   if (!isCompetitive(state) && !INJURIES.ENABLE_IN_FRIENDLIES) return state;
-
   const group = positionKeyToGroup(sanitizePos(victim.position));
   if (INJURIES.GK_IMMUNE && group === 'TOR') return state;
 
@@ -225,442 +138,336 @@ function maybeInjuryOnEvent(victim, state, kind) {
     const matches = sampleInjuryMatches();
     const after = substituteForInjury(victim, state);
     after.postMatch.injuries.push({ playerId: victim.id, matches });
-    after.log.push(createLogEntry('INJURY', after, { player: victim, matchesOut: matches }));
+    after.log.push(createLogEntry('INJURY', after, { playerId: victim.id, matchesOut: matches }));
     return after;
   }
   return state;
 }
 
-/* ---------------------------------------------------
-   Fallback: Ballverlust
---------------------------------------------------- */
-
+// Fallback: Ballverlust
 export function turnover(player, state) {
   const newState = cloneState(state);
-  const opponent = chooseInterceptionOpponent(player, newState);
-  newState.log.push(createLogEntry('TURNOVER', newState, { player, opponent }));
-  newState.ball.inPossessionOfTeam = opponent.teamId;
-  newState.ball.playerInPossessionId = opponent.id;
-  newState.meta.consecutiveTouches[player.id] = 0;
+  const opponent = getOpponent(player, newState);
+  newState.log.push(createLogEntry('TURNOVER', newState, { playerId: player.id, opponentId: opponent?.id || null }));
+  if (opponent) {
+    newState.ball.inPossessionOfTeam = opponent.teamId;
+    newState.ball.playerInPossessionId = opponent.id;
+  }
   return newState;
 }
 
-/* ---------------------------------------------------
-   Aktionen
---------------------------------------------------- */
+// ---------------------------------------------------
+// Aktionen
+// ---------------------------------------------------
 
 export function pass(player, state) {
   const newState = cloneState(state);
   const { log, playerRatings, playerStats } = newState;
+  ensurePlayerStats(playerStats, player.id);
 
-  newState.meta = newState.meta || { consecutiveTouches: {}, lastPassFrom: null, lastReceiver: null };
+  const actorGroup = positionKeyToGroup(player.position);
+  playerStats[player.id].passes += 1;
 
-  const newContext = {
-    type: 'OPEN_PLAY',
-    lastAction: 'PASS',
-    lastActionPlayerId: player.id,
-    potentialAssistBy: null,
-  };
-
-  if (playerStats[player.id]) playerStats[player.id].passes = (playerStats[player.id].passes || 0) + 1;
-
-  // --- GK: nur sichere Kurzpässe (100%) auf DEF (Fallback MID), Zone -> DEFENSIVDRITTEL
-  if (isGK(player)) {
-    const on = onPitchIds(newState);
-    const sameTeamOn = newState.players.filter(p =>
-      p.teamId === player.teamId && on.has(p.id) && !newState.sentOff[p.id] && !newState.injuredOff[p.id] && p.id !== player.id
-    );
-    const defs = sameTeamOn.filter(p => groupOf(p) === 'DEF');
-    const mids = sameTeamOn.filter(p => groupOf(p) === 'MID');
-    const recipient = defs.length ? defs[Math.floor(Math.random()*defs.length)]
-                                  : (mids[0] || sameTeamOn[0]);
-
+  // GK-Sicherpass (100% zur DEF)
+  if (actorGroup === 'TOR') {
+    const recipient = newState.players.find(p => p.teamId === player.teamId && positionKeyToGroup(p.position) === 'DEF') ||
+                      getTeamPlayer(player.teamId, newState.players, player.id);
     if (recipient) {
-      if (playerStats[player.id]) playerStats[player.id].passesCompleted = (playerStats[player.id].passesCompleted || 0) + 1;
-      applyRatingDelta(playerRatings, player.id, RATING_DELTAS.PASS_SUCCESS);
-      log.push(createLogEntry('PASS_SUCCESS', newState, { player, recipient }));
-
+      playerStats[player.id].passesCompleted += 1;
       newState.ball.playerInPossessionId = recipient.id;
-      const isHome = player.teamId === newState.homeTeam.id;
-      newState.ball.zone = isHome ? 'HOME_DEFENSE' : 'AWAY_DEFENSE';
-      newState.ball.context = newContext;
-      aiApplyTouchState(newState.meta, player.id, recipient.id);
+      log.push(createLogEntry('PASS_GK_SAFE', newState, { fromId: player.id, toId: recipient.id }));
       return newState;
     }
-    // Sollte praktisch nie passieren; ansonsten weiter im normalen Pfad.
   }
 
-  // --- normaler Pass (max. eine Zone vor, Empfängerwahl via AI-Helfer) ---
-  const opponentForCheck = getOpponent(player, newState);
   const bonus = getPositionalBonus('PASS', player.position);
-  const passSkill = player.strength + bonus;
-  const defenseSkill = opponentForCheck.strength + getPositionalBonus('TACKLE', opponentForCheck.position);
+  const passSkill = (player.strength || 50) + bonus;
+  const opponent = getOpponent(player, newState);
+  const defenseSkill = (opponent?.strength || 50) + getPositionalBonus('TACKLE', opponent?.position);
 
-  const base = 0.85;
-  if (calculateSuccess(passSkill, defenseSkill, base)) {
-    const on = onPitchIds(newState);
-    const teammates = newState.players
-      .filter(p => p.teamId === player.teamId && on.has(p.id) && !newState.sentOff[p.id] && !newState.injuredOff[p.id])
-      .filter(p => p.id !== player.id); // kein Selbstpass
-    const opponents = newState.players
-      .filter(p => p.teamId !== player.teamId && on.has(p.id) && !newState.sentOff[p.id] && !newState.injuredOff[p.id]);
-
-    const recipient =
-      aiFindBestPassRecipient({ passer: player, teammates, opponents, gameMeta: newState.meta, tactic: {}, state: newState }) ||
-      teammates[0];
-
+  if (calculateSuccess(passSkill, defenseSkill, 0.82)) {
+    const recipient = findBestPassRecipient(player, newState, 'NORMAL') || getTeamPlayer(player.teamId, newState.players, player.id);
     if (recipient) {
-      if (playerStats[player.id]) playerStats[player.id].passesCompleted = (playerStats[player.id].passesCompleted || 0) + 1;
-      applyRatingDelta(playerRatings, player.id, RATING_DELTAS.PASS_SUCCESS);
-      log.push(createLogEntry('PASS_SUCCESS', newState, { player, recipient }));
-
+      playerStats[player.id].passesCompleted += 1;
       newState.ball.playerInPossessionId = recipient.id;
-      const recGroup = groupOf(recipient);
-      const nextZone = computeZoneAfterPass(newState, player, recGroup);
-      if (nextZone) newState.ball.zone = nextZone;
-      newState.ball.context = newContext;
-      aiApplyTouchState(newState.meta, player.id, recipient.id);
+      newState.ball.zone = computeZoneAfterPass(player, newState, 'NORMAL'); // max 1 Zone vor
+      log.push(createLogEntry('PASS_SUCCESS', newState, { fromId: player.id, toId: recipient.id }));
       return newState;
     }
   }
 
-  // Fehlpass → Interception
-  const opponent = chooseInterceptionOpponent(player, newState);
-  if (playerStats[opponent.id]) playerStats[opponent.id].interceptions = (playerStats[opponent.id].interceptions || 0) + 1;
-  applyRatingDelta(playerRatings, player.id, RATING_DELTAS.PASS_FAIL);
-  applyRatingDelta(playerRatings, opponent.id, RATING_DELTAS.TACKLE_WIN);
-  log.push(createLogEntry('PASS_FAIL', newState, { player, opponent }));
+  // Fehlpass / Interception
+  if (opponent) {
+    ensurePlayerStats(playerStats, opponent.id);
+    playerStats[opponent.id].interceptions += 1;
+    log.push(createLogEntry('PASS_FAIL', newState, { fromId: player.id, opponentId: opponent.id }));
+    newState.ball.inPossessionOfTeam = opponent.teamId;
+    newState.ball.playerInPossessionId = opponent.id;
+  } else {
+    log.push(createLogEntry('PASS_FAIL', newState, { fromId: player.id, opponentId: null }));
+  }
+  return newState;
+}
 
-  newState.ball.inPossessionOfTeam = opponent.teamId;
-  newState.ball.playerInPossessionId = opponent.id;
-  newState.ball.context = newContext;
-  newState.meta.consecutiveTouches[player.id] = 0;
+export function throughBall(player, state) {
+  const newState = cloneState(state);
+  const { log, playerStats } = newState;
+  ensurePlayerStats(playerStats, player.id);
+  playerStats[player.id].throughBalls += 1;
+
+  // nur aus MID/ATT sinnvoll
+  const group = positionKeyToGroup(player.position);
+  if (group === 'DEF' || group === 'TOR') {
+    // Erzwinge NORMALEN Pass statt unlogischer Steckpässe
+    return pass(player, newState);
+  }
+
+  const bonus = getPositionalBonus('THROUGH_BALL', player.position);
+  const passSkill = (player.strength || 50) + bonus;
+  const opponent = getOpponent(player, newState);
+  const defenseSkill = (opponent?.strength || 50) + getPositionalBonus('TACKLE', opponent?.position);
+
+  if (calculateSuccess(passSkill, defenseSkill, 0.50)) {
+    const recipient = findBestPassRecipient(player, newState, 'THROUGH');
+    if (recipient) {
+      playerStats[player.id].throughBallsCompleted += 1;
+      newState.ball.playerInPossessionId = recipient.id;
+      newState.ball.zone = computeZoneAfterPass(player, newState, 'THROUGH'); // bis 2 Zonen vor
+      newState.ball.context = { type: 'OPEN_PLAY', lastAction: 'THROUGH_BALL', potentialAssistBy: player.id, priorityAction: 'MUST_SHOOT' };
+      log.push(createLogEntry('THROUGH_BALL_SUCCESS', newState, { fromId: player.id, toId: recipient.id }));
+      return newState;
+    }
+  }
+
+  log.push(createLogEntry('THROUGH_BALL_FAIL', newState, { fromId: player.id, opponentId: opponent?.id || null }));
+  // Ballverlust
+  if (opponent) {
+    newState.ball.inPossessionOfTeam = opponent.teamId;
+    newState.ball.playerInPossessionId = opponent.id;
+  }
+  return newState;
+}
+
+export function cross(player, state) {
+  const newState = cloneState(state);
+  const { log, playerStats, players } = newState;
+  ensurePlayerStats(playerStats, player.id);
+  playerStats[player.id].crosses += 1;
+
+  // nur Außen dürfen flanken, sonst normaler Pass
+  const b = sanitizePos(player.position);
+  const canCross = ['LA','RA','LM','RM','LV','RV'].includes(b);
+  if (!canCross) return pass(player, newState);
+
+  const bonus = getPositionalBonus('CROSS', player.position);
+  const crossSkill = (player.strength || 50) + bonus;
+  const opponent = getOpponent(player, newState);
+  const defenseSkill = (opponent?.strength || 50) + getPositionalBonus('TACKLE', opponent?.position);
+
+  if (calculateSuccess(crossSkill, defenseSkill, 0.60)) {
+    playerStats[player.id].crossesCompleted += 1;
+    // Ziel: Stürmer/HS/LA/RA bevorzugen
+    const target =
+      players.find(p => p.teamId === player.teamId && ['ST','MS','HS','LA','RA'].includes(sanitizePos(p.position))) ||
+      players.find(p => p.teamId === player.teamId);
+    if (target) {
+      newState.ball.playerInPossessionId = target.id;
+      newState.ball.context = { type: 'OPEN_PLAY', lastAction: 'CROSS', potentialAssistBy: player.id, priorityAction: 'MUST_SHOOT' };
+      log.push(createLogEntry('CROSS_SUCCESS', newState, { fromId: player.id, toId: target.id }));
+      return newState;
+    }
+  }
+
+  // Fehlschlag-Distribution: geblockt / abgefangen / ins Aus / Keeper pflückt
+  const r = Math.random();
+  if (r < 0.35 && opponent) {
+    // Block
+    log.push(createLogEntry('CROSS_BLOCKED', newState, { byId: opponent.id }));
+    newState.ball.inPossessionOfTeam = opponent.teamId;
+    newState.ball.playerInPossessionId = opponent.id;
+  } else if (r < 0.65 && opponent) {
+    // Abgefangen
+    log.push(createLogEntry('CROSS_INTERCEPTED', newState, { byId: opponent.id }));
+    newState.ball.inPossessionOfTeam = opponent.teamId;
+    newState.ball.playerInPossessionId = opponent.id;
+  } else if (r < 0.85) {
+    // Aus -> Abstoß (Keeper hat Ball)
+    const oppTeamId = player.teamId === newState.homeTeam.id ? newState.awayTeam.id : newState.homeTeam.id;
+    const gk = newState.players.find(p => p.teamId === oppTeamId && positionKeyToGroup(p.position) === 'TOR')
+      || newState.players.find(p => p.teamId === oppTeamId);
+    log.push(createLogEntry('CROSS_OUT', newState, { toGKId: gk?.id || null }));
+    if (gk) {
+      newState.ball.inPossessionOfTeam = oppTeamId;
+      newState.ball.playerInPossessionId = gk.id;
+      newState.ball.zone = (newState.homeTeam.id === oppTeamId) ? ZONES.HOME_DEFENSE : ZONES.AWAY_DEFENSE;
+    }
+  } else {
+    // Keeper pflückt
+    const oppTeamId = player.teamId === newState.homeTeam.id ? newState.awayTeam.id : newState.homeTeam.id;
+    const gk = newState.players.find(p => p.teamId === oppTeamId && positionKeyToGroup(p.position) === 'TOR')
+      || newState.players.find(p => p.teamId === oppTeamId);
+    log.push(createLogEntry('CROSS_CLAIMED_BY_GK', newState, { gkId: gk?.id || null }));
+    if (gk) {
+      newState.ball.inPossessionOfTeam = oppTeamId;
+      newState.ball.playerInPossessionId = gk.id;
+      newState.ball.zone = (newState.homeTeam.id === oppTeamId) ? ZONES.HOME_DEFENSE : ZONES.AWAY_DEFENSE;
+    }
+  }
   return newState;
 }
 
 export function dribble(player, state) {
   const newState = cloneState(state);
-  const { log, playerRatings, playerStats, homeTeam } = newState;
-  const opponent = pickOpponentForDuel(player, newState);
+  const { log, playerStats } = newState;
+  ensurePlayerStats(playerStats, player.id);
+  const opponent = getOpponent(player, newState);
+  if (opponent) ensurePlayerStats(playerStats, opponent.id);
 
-  if (playerStats[player.id]) playerStats[player.id].dribbles = (playerStats[player.id].dribbles || 0) + 1;
-  if (playerStats[opponent.id]) playerStats[opponent.id].tackles = (playerStats[opponent.id].tackles || 0) + 1;
+  playerStats[player.id].dribbles += 1;
+  if (opponent) playerStats[opponent.id].tackles += 1;
 
   const bonus = getPositionalBonus('DRIBBLE', player.position);
-  const dribbleSkill = player.strength + bonus;
-  const tackleSkill = opponent.strength + getPositionalBonus('TACKLE', opponent.position);
+  const dribbleSkill = (player.strength || 50) + bonus;
+  const tackleSkill = (opponent?.strength || 50) + getPositionalBonus('TACKLE', opponent?.position);
 
-  if (calculateSuccess(dribbleSkill, tackleSkill, 0.7)) {
-    if (playerStats[player.id]) playerStats[player.id].dribblesSucceeded = (playerStats[player.id].dribblesSucceeded || 0) + 1;
-    applyRatingDelta(playerRatings, player.id, RATING_DELTAS.DRIBBLE_SUCCESS);
-    log.push(createLogEntry('DRIBBLE_SUCCESS', newState, { player, opponent }));
+  if (calculateSuccess(dribbleSkill, tackleSkill, 0.68)) {
+    playerStats[player.id].dribblesSucceeded += 1;
+    log.push(createLogEntry('DRIBBLE_SUCCESS', newState, { playerId: player.id, beatenId: opponent?.id || null }));
 
-    const isHomeTeam = player.teamId === homeTeam.id;
-    const orderHome = ['HOME_DEFENSE', 'HOME_MIDFIELD', 'AWAY_MIDFIELD', 'AWAY_ATTACK'];
-    const orderAway = ['AWAY_ATTACK', 'AWAY_MIDFIELD', 'HOME_MIDFIELD', 'HOME_DEFENSE'];
-    const order = isHomeTeam ? orderHome : orderAway;
-    const idx = Math.max(0, order.indexOf(newState.ball.zone));
-    const newZone = order[Math.min(idx + 1, order.length - 1)];
+    // eine Zone vor
+    const nextZone = oneStepForwardZone(newState.ball.zone, player.teamId, newState);
+    newState.ball.zone = nextZone;
+    newState.ball.context = { type: 'OPEN_PLAY', lastAction: 'DRIBBLE_SUCCESS', lastActionPlayerId: player.id, potentialAssistBy: null };
 
-    const ctx = {
-      type: 'OPEN_PLAY',
-      lastAction: 'DRIBBLE_SUCCESS',
-      lastActionPlayerId: player.id,
-      potentialAssistBy: null,
-      justBeatenPlayerId: opponent.id,
-    };
-
-    const isAttackingZone =
-      (isHomeTeam && newZone === 'AWAY_ATTACK') || (!isHomeTeam && newZone === 'HOME_DEFENSE');
-    if (isAttackingZone) ctx.priorityAction = 'MUST_SHOOT';
-
-    newState.ball.zone = newZone;
-    newState.ball.context = ctx;
+    // im letzten Drittel: Schuss forcieren
+    const isHome = player.teamId === newState.homeTeam.id;
+    const attackingZone = isHome ? ZONES.AWAY_ATT : ZONES.HOME_DEFENSE;
+    if (newState.ball.zone === attackingZone) {
+      newState.ball.context.priorityAction = 'MUST_SHOOT';
+    }
     return newState;
   }
 
-  // evtl. Foul (20%), sonst sauberer Tacklesieg
-  if (Math.random() < 0.2) {
+  // 20% Foul
+  if (Math.random() < 0.20 && opponent) {
     return foul(opponent, player, newState);
   }
 
-  if (playerStats[opponent.id]) playerStats[opponent.id].tacklesSucceeded = (playerStats[opponent.id].tacklesSucceeded || 0) + 1;
-  applyRatingDelta(playerRatings, opponent.id, RATING_DELTAS.TACKLE_WIN);
-  applyRatingDelta(playerRatings, player.id, RATING_DELTAS.DRIBBLE_FAIL);
-  log.push(createLogEntry('TACKLE_WIN', newState, { player, opponent }));
+  // Tacklesieg
+  if (opponent) {
+    playerStats[opponent.id].tacklesSucceeded += 1;
+    log.push(createLogEntry('TACKLE_WIN', newState, { playerId: opponent.id, againstId: player.id }));
+    const after = maybeInjuryOnEvent(player, newState, 'DUEL_LOSS');
+    after.ball.inPossessionOfTeam = opponent.teamId;
+    after.ball.playerInPossessionId = opponent.id;
+    after.ball.context = { type: 'OPEN_PLAY', lastAction: 'TACKLE_WIN', lastActionPlayerId: opponent.id, potentialAssistBy: null };
+    return after;
+  }
 
-  // Verletzungschance (verlorener Zweikampf)
-  const after = maybeInjuryOnEvent(player, newState, 'DUEL_LOSS');
-
-  after.ball.inPossessionOfTeam = opponent.teamId;
-  after.ball.playerInPossessionId = opponent.id;
-  after.ball.context = {
-    type: 'OPEN_PLAY',
-    lastAction: 'TACKLE_WIN',
-    lastActionPlayerId: opponent.id,
-    potentialAssistBy: null,
-  };
-  after.meta.consecutiveTouches[player.id] = 0;
-  return after;
+  return newState;
 }
 
 export function shoot(player, state) {
   const newState = cloneState(state);
-  const { log, playerRatings, playerStats, homeTeam, awayTeam, players } = newState;
-
-  if (playerStats[player.id]) playerStats[player.id].shots = (playerStats[player.id].shots || 0) + 1;
+  const { log, playerStats, homeTeam, awayTeam, players } = newState;
+  ensurePlayerStats(playerStats, player.id);
+  playerStats[player.id].shots += 1;
 
   const bonus = getPositionalBonus('SHOOT', player.position);
-  const shootSkill = player.strength + bonus;
+  const shootSkill = (player.strength || 50) + bonus;
 
-  const opponentTeamId = player.teamId === homeTeam.id ? awayTeam.id : homeTeam.id;
+  const oppTeamId = player.teamId === homeTeam.id ? awayTeam.id : homeTeam.id;
   const goalkeeper =
-    players.find(p => p.teamId === opponentTeamId && positionKeyToGroup(sanitizePos(p.position)) === 'TOR') ||
-    players.find(p => p.teamId === opponentTeamId);
+    players.find(p => p.teamId === oppTeamId && positionKeyToGroup(p.position) === 'TOR') ||
+    players.find(p => p.teamId === oppTeamId);
 
-  const onTargetChance = Math.max(0.2, Math.min(0.9, 0.7 + (player.strength - 75) / 100));
+  const onTargetChance = clamp(0.45 + (safe(player.strength)-70)/120, 0.20, 0.90);
+  function safe(x){ const n=Number(x); return Number.isFinite(n)?n:50; }
 
   if (Math.random() > onTargetChance) {
-    applyRatingDelta(playerRatings, player.id, RATING_DELTAS.SHOT_OFF_TARGET);
-    log.push(createLogEntry('SHOT_OFF_TARGET', newState, { player, opponent: goalkeeper }));
-
-    const defenseZone = homeTeam.id === opponentTeamId ? 'HOME_DEFENSE' : 'AWAY_DEFENSE';
-    const ctx = { type: 'OPEN_PLAY', lastAction: 'SHOT_OFF_TARGET', lastActionPlayerId: player.id };
-    newState.ball.inPossessionOfTeam = opponentTeamId;
+    log.push(createLogEntry('SHOT_OFF_TARGET', newState, { playerId: player.id, gkId: goalkeeper?.id || null }));
+    const defenseZone = homeTeam.id === oppTeamId ? ZONES.HOME_DEFENSE : ZONES.AWAY_DEFENSE;
+    newState.ball.inPossessionOfTeam = oppTeamId;
     newState.ball.playerInPossessionId = goalkeeper?.id || null;
     newState.ball.zone = defenseZone;
-    newState.ball.context = ctx;
-    newState.meta.consecutiveTouches[player.id] = 0;
+    newState.ball.context = { type: 'OPEN_PLAY', lastAction: 'SHOT_OFF_TARGET', lastActionPlayerId: player.id, potentialAssistBy: null };
     return newState;
   }
 
-  if (playerStats[player.id]) playerStats[player.id].shotsOnTarget = (playerStats[player.id].shotsOnTarget || 0) + 1;
+  playerStats[player.id].shotsOnTarget += 1;
 
   if (!goalkeeper) {
-    if (playerStats[player.id]) playerStats[player.id].goals = (playerStats[player.id].goals || 0) + 1;
-    applyRatingDelta(playerRatings, player.id, RATING_DELTAS.SHOOT_EMPTY_NET);
-
+    playerStats[player.id].goals += 1;
+    log.push(createLogEntry('GOAL_EMPTY_NET', newState, { playerId: player.id }));
     const newHomeScore = player.teamId === homeTeam.id ? newState.homeScore + 1 : newState.homeScore;
     const newAwayScore = player.teamId === awayTeam.id ? newState.awayScore + 1 : newState.awayScore;
-
-    log.push(createLogEntry('SHOOT_EMPTY_NET', { ...newState, homeScore: newHomeScore, awayScore: newAwayScore }, { player }));
-
-    const kickoffPlayer =
-      players.find(p => p.teamId === opponentTeamId && p.positionGroup === 'ATT') ||
-      players.find(p => p.teamId === opponentTeamId);
-
     newState.homeScore = newHomeScore;
     newState.awayScore = newAwayScore;
-    newState.ball = {
-      inPossessionOfTeam: opponentTeamId,
-      playerInPossessionId: kickoffPlayer?.id || null,
-      zone: 'HOME_MIDFIELD',
-      context: { type: 'KICKOFF' },
-    };
-    newState.log.push(createLogEntry('KICKOFF', newState, { player: kickoffPlayer }));
+
+    const kickoff = players.find(p => p.teamId === oppTeamId) || null;
+    newState.ball = { inPossessionOfTeam: oppTeamId, playerInPossessionId: kickoff?.id || null, zone: ZONES.HOME_MIDFIELD, context: { type: 'KICKOFF' } };
+    newState.log.push(createLogEntry('KICKOFF', newState, { playerId: kickoff?.id || null }));
     return newState;
   }
 
-  const goalkeeperSkill = goalkeeper.strength + getPositionalBonus('SAVE', sanitizePos(goalkeeper.position) || 'TW');
+  const goalkeeperSkill = (goalkeeper.strength || 50) + getPositionalBonus('SAVE', sanitizePos(goalkeeper.position));
 
-  // Tor?
   if (calculateSuccess(shootSkill, goalkeeperSkill, 0.45)) {
-    if (playerStats[player.id]) playerStats[player.id].goals = (playerStats[player.id].goals || 0) + 1;
-    applyRatingDelta(playerRatings, player.id, RATING_DELTAS.GOAL);
+    playerStats[player.id].goals += 1;
 
-    const assisterId = newState.ball.context?.potentialAssistBy;
-    if (assisterId && playerStats[assisterId]) {
+    const assisterId = newState.ball.context?.potentialAssistBy || null;
+    if (assisterId) {
+      ensurePlayerStats(playerStats, assisterId);
       playerStats[assisterId].assists = (playerStats[assisterId].assists || 0) + 1;
-      applyRatingDelta(playerRatings, assisterId, RATING_DELTAS.ASSIST);
-      log.push(createLogEntry('ASSIST', newState, { player: getPlayerById(newState.players, assisterId) }));
+      newState.log.push(createLogEntry('ASSIST', newState, { playerId: assisterId }));
     }
 
     const newHomeScore = player.teamId === homeTeam.id ? newState.homeScore + 1 : newState.homeScore;
     const newAwayScore = player.teamId === awayTeam.id ? newState.awayScore + 1 : newState.awayScore;
 
-    log.push(createLogEntry('GOAL', { ...newState, homeScore: newHomeScore, awayScore: newAwayScore }, { player, opponent: goalkeeper }));
+    newState.log.push(createLogEntry('GOAL', { ...newState, homeScore: newHomeScore, awayScore: newAwayScore }, { playerId: player.id, gkId: goalkeeper.id }));
 
-    const kickoffPlayer =
-      newState.players.find(p => p.teamId === opponentTeamId && p.positionGroup === 'ATT') ||
-      newState.players.find(p => p.teamId === opponentTeamId);
-
+    const kickoff = newState.players.find(p => p.teamId === oppTeamId) || null;
     newState.homeScore = newHomeScore;
     newState.awayScore = newAwayScore;
-    newState.ball = {
-      inPossessionOfTeam: opponentTeamId,
-      playerInPossessionId: kickoffPlayer?.id || null,
-      zone: 'HOME_MIDFIELD',
-      context: { type: 'KICKOFF' },
-    };
-    newState.log.push(createLogEntry('KICKOFF', newState, { player: kickoffPlayer }));
+    newState.ball = { inPossessionOfTeam: oppTeamId, playerInPossessionId: kickoff?.id || null, zone: ZONES.HOME_MIDFIELD, context: { type: 'KICKOFF' } };
+    newState.log.push(createLogEntry('KICKOFF', newState, { playerId: kickoff?.id || null }));
     return newState;
   }
 
   // gehalten
-  if (playerStats[goalkeeper.id]) playerStats[goalkeeper.id].saves = (playerStats[goalkeeper.id].saves || 0) + 1;
-  applyRatingDelta(playerRatings, player.id, RATING_DELTAS.SHOOT_SAVE_PLAYER);
-  applyRatingDelta(playerRatings, goalkeeper.id, RATING_DELTAS.SHOOT_SAVE_GK);
+  ensurePlayerStats(playerStats, goalkeeper.id);
+  playerStats[goalkeeper.id].saves += 1;
+  newState.log.push(createLogEntry('SHOOT_SAVE', newState, { playerId: player.id, gkId: goalkeeper.id }));
 
-  if (Math.random() < 0.25) {
-    log.push(createLogEntry('SHOOT_SAVE', newState, { player, opponent: goalkeeper }));
-    log.push(createLogEntry('REBOUND_SCRAMBLE', newState));
+  // Rebound?
+  if (Math.random() < 0.27) {
     newState.ball.inPossessionOfTeam = player.teamId;
     newState.ball.playerInPossessionId = null;
     newState.ball.context = { type: 'REBOUND' };
     return newState;
   }
 
-  log.push(createLogEntry('SHOOT_SAVE', newState, { player, opponent: goalkeeper }));
-  const defenseZone = homeTeam.id === opponentTeamId ? 'HOME_DEFENSE' : 'AWAY_DEFENSE';
-  const ctx = { type: 'OPEN_PLAY', lastAction: 'SAVE', lastActionPlayerId: goalkeeper.id, potentialAssistBy: null };
+  const defenseZone = homeTeam.id === oppTeamId ? ZONES.HOME_DEFENSE : ZONES.AWAY_DEFENSE;
   newState.ball.inPossessionOfTeam = goalkeeper.teamId;
   newState.ball.playerInPossessionId = goalkeeper.id;
   newState.ball.zone = defenseZone;
-  newState.ball.context = ctx;
-  newState.meta.consecutiveTouches[player.id] = 0;
-  return newState;
-}
-
-export function cross(player, state) {
-  const newState = cloneState(state);
-  const { log, playerRatings, playerStats, players, homeTeam } = newState;
-  const newContext = { type: 'OPEN_PLAY', lastAction: 'CROSS', lastActionPlayerId: player.id, potentialAssistBy: null };
-
-  if (playerStats[player.id]) playerStats[player.id].crosses = (playerStats[player.id].crosses || 0) + 1;
-
-  const bonus = getPositionalBonus('CROSS', player.position);
-  const crossSkill = player.strength + bonus;
-  const opponent = pickOpponentForDuel(player, newState);
-  const defenseSkill = opponent.strength + getPositionalBonus('TACKLE', opponent.position);
-
-  if (calculateSuccess(crossSkill, defenseSkill, 0.7)) {
-    if (playerStats[player.id]) playerStats[player.id].crossesCompleted = (playerStats[player.id].crossesCompleted || 0) + 1;
-    applyRatingDelta(playerRatings, player.id, RATING_DELTAS.CROSS_SUCCESS);
-
-    const target =
-      players.find(p => p.teamId === player.teamId && ['ST','MS','HS'].includes(sanitizePos(p.position))) ||
-      players.find(p => p.teamId === player.teamId);
-
-    if (target) {
-      log.push(createLogEntry('CROSS_SUCCESS', newState, { player, recipient: target }));
-      newContext.potentialAssistBy = player.id;
-      newContext.priorityAction = 'MUST_SHOOT';
-      newState.ball.playerInPossessionId = target.id;
-      newState.ball.context = newContext;
-      return newState;
-    }
-  }
-
-  // Realistischere Verteilung für fehlgeschlagene Flanke
-  const r = Math.random();
-  if (r < CROSS_FAIL_DISTR.DEF_INTERCEPT) {
-    // Abwehr klärt → Gegner in Ballbesitz
-    const opp = chooseInterceptionOpponent(player, newState);
-    applyRatingDelta(playerRatings, player.id, RATING_DELTAS.CROSS_FAIL);
-    log.push(createLogEntry('CROSS_FAIL_BLOCKED', newState, { player, opponent: opp }));
-
-    newState.ball.inPossessionOfTeam = opp.teamId;
-    newState.ball.playerInPossessionId = opp.id;
-    newState.ball.context = newContext;
-    return newState;
-  } else if (r < CROSS_FAIL_DISTR.DEF_INTERCEPT + CROSS_FAIL_DISTR.GK_CLAIM) {
-    // Keeper pflückt
-    const oppTeamId = player.teamId === homeTeam.id ? newState.awayTeam.id : newState.homeTeam.id;
-    const gk =
-      players.find(p => p.teamId === oppTeamId && positionKeyToGroup(sanitizePos(p.position)) === 'TOR') ||
-      players.find(p => p.teamId === oppTeamId);
-
-    applyRatingDelta(playerRatings, player.id, RATING_DELTAS.CROSS_FAIL);
-    log.push(createLogEntry('CROSS_FAIL_GK_CLAIM', newState, { player, opponent: gk }));
-
-    const defenseZone = homeTeam.id === oppTeamId ? 'HOME_DEFENSE' : 'AWAY_DEFENSE';
-    newState.ball.inPossessionOfTeam = oppTeamId;
-    newState.ball.playerInPossessionId = gk?.id || null;
-    newState.ball.zone = defenseZone;
-    newState.ball.context = newContext;
-    return newState;
-  } else {
-    // Überhitzt/ins Aus → Abstoß
-    applyRatingDelta(playerRatings, player.id, RATING_DELTAS.CROSS_FAIL);
-    log.push(createLogEntry('CROSS_FAIL_OVERHIT', newState, { player }));
-
-    const oppTeamId = player.teamId === homeTeam.id ? newState.awayTeam.id : newState.homeTeam.id;
-    const gk =
-      players.find(p => p.teamId === oppTeamId && positionKeyToGroup(sanitizePos(p.position)) === 'TOR') ||
-      players.find(p => p.teamId === oppTeamId);
-
-    const defenseZone = homeTeam.id === oppTeamId ? 'HOME_DEFENSE' : 'AWAY_DEFENSE';
-    newState.ball.inPossessionOfTeam = oppTeamId;
-    newState.ball.playerInPossessionId = gk?.id || null;
-    newState.ball.zone = defenseZone;
-    newState.ball.context = { type: 'OPEN_PLAY', lastAction: 'GOAL_KICK', lastActionPlayerId: gk?.id || null };
-    return newState;
-  }
-}
-
-export function throughBall(player, state) {
-  const newState = cloneState(state);
-  const { log, playerRatings, playerStats } = newState;
-  const newContext = { type: 'OPEN_PLAY', lastAction: 'THROUGH_BALL', lastActionPlayerId: player.id, potentialAssistBy: null };
-
-  if (playerStats[player.id]) playerStats[player.id].throughBalls = (playerStats[player.id].throughBalls || 0) + 1;
-
-  const bonus = getPositionalBonus('THROUGH_BALL', player.position);
-  const passSkill = player.strength + bonus;
-  const opponent = pickOpponentForDuel(player, newState);
-  const defenseSkill = opponent.strength + getPositionalBonus('TACKLE', opponent.position);
-
-  const base = 0.5;
-  if (calculateSuccess(passSkill, defenseSkill, base)) {
-    if (playerStats[player.id]) playerStats[player.id].throughBallsCompleted = (playerStats[player.id].throughBallsCompleted || 0) + 1;
-    applyRatingDelta(playerRatings, player.id, RATING_DELTAS.THROUGH_BALL_SUCCESS);
-
-    const on = onPitchIds(newState);
-    const teammates = newState.players.filter(p => p.teamId === player.teamId && on.has(p.id) && !newState.sentOff[p.id] && !newState.injuredOff[p.id]).filter(p => p.id !== player.id);
-    const opponents = newState.players.filter(p => p.teamId !== player.teamId && on.has(p.id) && !newState.sentOff[p.id] && !newState.injuredOff[p.id]);
-
-    // Empfängerwahl (innerhalb der Zonenregel über AI-Helfer)
-    const recipient = aiFindBestPassRecipient({ passer: player, teammates, opponents, gameMeta: newState.meta, tactic: {}, state: newState });
-    if (recipient) {
-      log.push(createLogEntry('THROUGH_BALL_SUCCESS', newState, { player, recipient }));
-      newContext.potentialAssistBy = player.id;
-      newContext.priorityAction = 'MUST_SHOOT';
-      newState.ball.playerInPossessionId = recipient.id;
-      // Zone maximal eine weiter – über computeZoneAfterPass
-      const recGroup = groupOf(recipient);
-      const nextZone = computeZoneAfterPass(newState, player, recGroup);
-      if (nextZone) newState.ball.zone = nextZone;
-      newState.ball.context = newContext;
-      return newState;
-    }
-  }
-
-  applyRatingDelta(playerRatings, player.id, RATING_DELTAS.THROUGH_BALL_FAIL);
-  log.push(createLogEntry('THROUGH_BALL_FAIL', newState, { player, opponent }));
-
-  const intercept = chooseInterceptionOpponent(player, newState);
-  newState.ball.inPossessionOfTeam = intercept.teamId;
-  newState.ball.playerInPossessionId = intercept.id;
-  newState.ball.context = newContext;
-  newState.meta.consecutiveTouches[player.id] = 0;
+  newState.ball.context = { type: 'OPEN_PLAY', lastAction: 'SAVE', lastActionPlayerId: goalkeeper.id, potentialAssistBy: null };
   return newState;
 }
 
 export function foul(fouler, fouledPlayer, state) {
   const newState = cloneState(state);
-  const { log, playerRatings, playerStats } = newState;
+  const { log, playerStats } = newState;
+  ensurePlayerStats(playerStats, fouler.id);
+  ensurePlayerStats(playerStats, fouledPlayer.id);
 
-  if (playerStats[fouler.id]) playerStats[fouler.id].foulsCommitted = (playerStats[fouler.id].foulsCommitted || 0) + 1;
-
-  applyRatingDelta(playerRatings, fouler.id, RATING_DELTAS.FOUL_COMMITTED);
-  applyRatingDelta(playerRatings, fouledPlayer.id, RATING_DELTAS.FOUL_DRAWN);
-
-  log.push(createLogEntry('FOUL', newState, { player: fouler, opponent: fouledPlayer }));
+  playerStats[fouler.id].foulsCommitted += 1;
+  newState.log.push(createLogEntry('FOUL', newState, { byId: fouler.id, onId: fouledPlayer.id }));
 
   // Karten (nur Pflichtspiele)
   let bookedState = maybeBookCard(fouler, newState);
-
-  // Verletzungschance für den Gefoulten (Auto-Wechsel)
+  // Verletzungschance
   bookedState = maybeInjuryOnEvent(fouledPlayer, bookedState, 'FOUL');
 
   // Freistoß für den Gefoulten
@@ -679,58 +486,49 @@ export function foul(fouler, fouledPlayer, state) {
 
 export function handleFreeKick(player, state) {
   const newState = cloneState(state);
-  const { log } = newState;
+  const foulZone = newState.ball.context?.foulLocation || newState.ball.zone;
+  const isHome = player.teamId === newState.homeTeam.id;
+  const isAttacking = (isHome && foulZone === ZONES.AWAY_ATT) || (!isHome && foulZone === ZONES.HOME_DEFENSE);
 
-  const foulZone = newState.ball.context.foulLocation;
-  const isHomeTeam = player.teamId === newState.homeTeam.id;
-  const isAttackingZone =
-    (isHomeTeam && foulZone === 'AWAY_ATTACK') || (!isHomeTeam && foulZone === 'HOME_DEFENSE');
-
-  if (isAttackingZone) {
-    log.push(createLogEntry('FREE_KICK_SHOOT', newState, { player }));
+  if (isAttacking) {
+    newState.log.push(createLogEntry('FREE_KICK_SHOOT', newState, { playerId: player.id }));
     return shoot(player, newState);
   }
-
-  log.push(createLogEntry('FREE_KICK_PASS', newState, { player }));
+  newState.log.push(createLogEntry('FREE_KICK_PASS', newState, { playerId: player.id }));
   return pass(player, newState);
 }
 
 export function scrambleForRebound(state) {
   const newState = cloneState(state);
-  const { log, playerRatings, players, homeTeam } = newState;
+  const { log, players, homeTeam } = newState;
 
-  const attackingTeamId = newState.ball.inPossessionOfTeam;
-  const defendingTeamId = attackingTeamId === homeTeam.id ? newState.awayTeam.id : homeTeam.id;
+  const attTeamId = newState.ball.inPossessionOfTeam;
+  const defTeamId = attTeamId === homeTeam.id ? newState.awayTeam.id : homeTeam.id;
 
   const attacker =
-    players.find(p => p.teamId === attackingTeamId && p.positionGroup === 'ATT') ||
-    getTeamPlayer(attackingTeamId, players, null, newState);
+    players.find(p => p.teamId === attTeamId && positionKeyToGroup(p.position) === 'ATT') ||
+    getTeamPlayer(attTeamId, players, null);
 
   const defender =
-    players.find(p => p.teamId === defendingTeamId && p.positionGroup === 'DEF') ||
-    getTeamPlayer(defendingTeamId, players, null, newState);
+    players.find(p => p.teamId === defTeamId && positionKeyToGroup(p.position) === 'DEF') ||
+    getTeamPlayer(defTeamId, players, null);
 
   if (!attacker || !defender) {
-    log.push(createLogEntry('REBOUND_LOSE', newState, { opponent: { nachname: 'Abwehr' } }));
-    const randomDefender =
-      getTeamPlayer(defendingTeamId, players, null, newState) ||
-      players.find(p => p.teamId === defendingTeamId);
-    newState.ball.inPossessionOfTeam = defendingTeamId;
-    newState.ball.playerInPossessionId = randomDefender?.id || null;
+    const rndDef = getTeamPlayer(defTeamId, players, null) || players.find(p => p.teamId === defTeamId);
+    newState.log.push(createLogEntry('REBOUND_LOSE', newState, { byId: rndDef?.id || null }));
+    newState.ball.inPossessionOfTeam = defTeamId;
+    newState.ball.playerInPossessionId = rndDef?.id || null;
     newState.ball.context = { type: 'OPEN_PLAY' };
     return newState;
   }
 
-  if (calculateSuccess(attacker.strength, defender.strength, 0.5)) {
-    applyRatingDelta(playerRatings, attacker.id, RATING_DELTAS.REBOUND_WIN);
-    log.push(createLogEntry('REBOUND_WIN', newState, { player: attacker }));
+  if (calculateSuccess(attacker.strength, defender.strength, 0.50)) {
+    newState.log.push(createLogEntry('REBOUND_WIN', newState, { byId: attacker.id }));
     return shoot(attacker, newState);
   }
 
-  applyRatingDelta(playerRatings, defender.id, RATING_DELTAS.REBOUND_LOSE_DEF);
-  log.push(createLogEntry('REBOUND_LOSE', newState, { opponent: defender }));
-
-  newState.ball.inPossessionOfTeam = defendingTeamId;
+  newState.log.push(createLogEntry('REBOUND_LOSE', newState, { byId: defender.id }));
+  newState.ball.inPossessionOfTeam = defTeamId;
   newState.ball.playerInPossessionId = defender.id;
   newState.ball.context = { type: 'OPEN_PLAY' };
   return newState;

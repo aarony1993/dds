@@ -3,7 +3,8 @@ import {
   Box, Paper, Typography, MenuItem, Select, Button, Dialog, DialogTitle,
   DialogContent, DialogActions, List, ListItemAvatar, Avatar, ListItemText,
   Tooltip, CircularProgress, FormControl, FormLabel, RadioGroup,
-  FormControlLabel, Radio, Divider, ListItemButton, Tabs, Tab, Chip, Stack, TextField, IconButton
+  FormControlLabel, Radio, Divider, ListItemButton, Tabs, Tab, Chip, Stack, TextField, IconButton,
+  Switch, Slider
 } from "@mui/material";
 import { useAuth } from "../context/AuthContext";
 import { db } from "../firebase/config";
@@ -90,6 +91,45 @@ const canPlayPosition = (player, posKey) => {
   return player.position === base || player.positionGroup === group;
 };
 
+function roleOptionsForBase(base) {
+  const group = positionGroupMapping[base] || base;
+  switch (group) {
+    case "TOR":
+      return [
+        { v: "auto", l: "Auto" },
+        { v: "sweeper-keeper", l: "Mitspielender TW" },
+        { v: "shot-stopper", l: "Linien-TW" },
+      ];
+    case "DEF":
+      return [
+        { v: "auto", l: "Auto" },
+        { v: "ball-playing", l: "Aufbau-/Spielmacher (hinten)" },
+        { v: "stopper", l: "Abräumer/Stopper" },
+        { v: "fullback-overlap", l: "Außen: Überlaufend" },
+        { v: "inverted-fullback", l: "Außen: Invers" },
+      ];
+    case "MID":
+      return [
+        { v: "auto", l: "Auto" },
+        { v: "deep-lying", l: "Tiefer Spielmacher" },
+        { v: "ball-winning", l: "Zweikämpfer" },
+        { v: "box-to-box", l: "Box-to-Box" },
+        { v: "enganche", l: "Zehner" },
+      ];
+    case "ATT":
+      return [
+        { v: "auto", l: "Auto" },
+        { v: "target", l: "Zielspieler" },
+        { v: "poacher", l: "Knipser" },
+        { v: "false9", l: "Falsche Neun" },
+        { v: "inside-forward", l: "Invertierter Flügel" },
+        { v: "touchline-winger", l: "Linienkleber" },
+      ];
+    default:
+      return [{ v: "auto", l: "Auto" }];
+  }
+}
+
 // --- Hauptkomponente ---
 export default function Taktikboard() {
   const { user } = useAuth();
@@ -103,15 +143,22 @@ export default function Taktikboard() {
   const [players, setPlayers] = useState([]);
   const [formationKey, setFormationKey] = useState("4-4-2 Flach");
   const [fieldPlayers, setFieldPlayers] = useState({}); // { posKey: { playerId, instructions } }
-  const [defensiveLine, setDefensiveLine] = useState("normal");
-  const [passStyle, setPassStyle] = useState("gemischt");
+
+  // Team-Anweisungen (neu erweitert)
+  const [defensiveLine, setDefensiveLine] = useState("normal"); // tief | normal | hoch
+  const [passStyle, setPassStyle] = useState("gemischt");       // sicher | gemischt | riskant
+  const [pressing, setPressing] = useState("mittel");           // tief | mittel | hoch
+  const [tempo, setTempo] = useState(50);                       // 0-100 Slider
+  const [width, setWidth] = useState("normal");                 // eng | normal | breit
+  const [counterPress, setCounterPress] = useState(true);       // boolean
+  const [timeWaste, setTimeWaste] = useState("aus");            // aus | leicht | stark
 
   // Save-Status
   const [saveState, setSaveState] = useState("idle"); // idle | saving | saved | error
   const [lastSaved, setLastSaved] = useState(null);
 
   // Vorlagen
-  const [templates, setTemplates] = useState([]); // {id, name, formationKey, fieldPlayers, defensiveLine, passStyle, createdAt}
+  const [templates, setTemplates] = useState([]); // {id, name, formationKey, fieldPlayers, defensiveLine, passStyle, pressing, tempo, width, counterPress, timeWaste, createdAt}
   const [saveTemplateOpen, setSaveTemplateOpen] = useState(false);
   const [templateName, setTemplateName] = useState("");
   const [renameId, setRenameId] = useState(null);
@@ -161,8 +208,15 @@ export default function Taktikboard() {
             });
             setFieldPlayers(fp);
           }
+          // alte Felder
           setDefensiveLine(t.tacticDefensiveLine || "normal");
           setPassStyle(t.tacticPassStyle || "gemischt");
+          // neue Felder (mit Defaults)
+          setPressing(t.tacticPressing || "mittel");
+          setTempo(typeof t.tacticTempo === "number" ? t.tacticTempo : 50);
+          setWidth(t.tacticWidth || "normal");
+          setCounterPress(typeof t.tacticCounterPress === "boolean" ? t.tacticCounterPress : true);
+          setTimeWaste(t.tacticTimeWaste || "aus");
         }
 
         await loadTemplates(); // Vorlagen laden
@@ -182,7 +236,6 @@ export default function Taktikboard() {
       const colRef = collection(db, "teams", user.teamId, "tacticTemplates");
       const snap = await getDocs(colRef);
       const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-      // optional sort nach createdAt desc
       list.sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
       setTemplates(list);
     } catch (e) {
@@ -212,8 +265,15 @@ export default function Taktikboard() {
         await updateDoc(doc(db, "teams", user.teamId), {
           defaultFormation: formationData,
           formationKey,
+          // alt
           tacticDefensiveLine: defensiveLine,
           tacticPassStyle: passStyle,
+          // neu
+          tacticPressing: pressing,
+          tacticTempo: tempo,
+          tacticWidth: width,
+          tacticCounterPress: counterPress,
+          tacticTimeWaste: timeWaste,
         });
         setSaveState("saved");
         setLastSaved(new Date());
@@ -223,7 +283,10 @@ export default function Taktikboard() {
       }
     }, 600);
     return () => clearTimeout(tid);
-  }, [user?.teamId, loading, fieldPlayers, formationKey, defensiveLine, passStyle, formation]);
+  }, [
+    user?.teamId, loading, fieldPlayers, formationKey,
+    defensiveLine, passStyle, pressing, tempo, width, counterPress, timeWaste, formation
+  ]);
 
   // --- Handlers ---
   const handleFormationChange = (e) => {
@@ -306,13 +369,18 @@ export default function Taktikboard() {
     if (!user?.teamId) return;
     const trimmed = templateName.trim();
     if (!trimmed) return;
-    // Wir speichern fieldPlayers genau so, wie es im State ist (inkl. Anweisungen)
     const payload = {
       name: trimmed,
       formationKey,
       fieldPlayers,
       defensiveLine,
       passStyle,
+      // neu
+      pressing,
+      tempo,
+      width,
+      counterPress,
+      timeWaste,
       createdAt: serverTimestamp(),
     };
     try {
@@ -327,13 +395,16 @@ export default function Taktikboard() {
 
   const applyTemplate = (tpl) => {
     if (!tpl) return;
-    // Vorsicht: Nur Positionen verwenden, die in der aktuellen Formation existieren?
-    // Hier: Wir setzen formationKey auf die gespeicherte Formation und übernehmen fieldPlayers 1:1.
     setFormationKey(tpl.formationKey);
     setFieldPlayers(tpl.fieldPlayers || {});
     setDefensiveLine(tpl.defensiveLine || "normal");
     setPassStyle(tpl.passStyle || "gemischt");
-    // Dein Autosave greift dann und schreibt diese Werte.
+    // neu
+    setPressing(tpl.pressing || "mittel");
+    setTempo(typeof tpl.tempo === "number" ? tpl.tempo : 50);
+    setWidth(tpl.width || "normal");
+    setCounterPress(typeof tpl.counterPress === "boolean" ? tpl.counterPress : true);
+    setTimeWaste(tpl.timeWaste || "aus");
   };
 
   const deleteTemplate = async (id) => {
@@ -463,7 +534,7 @@ export default function Taktikboard() {
               Team-Anweisungen
             </Typography>
 
-            <FormControl component="fieldset">
+            <FormControl component="fieldset" sx={{ mb: 1.5 }}>
               <FormLabel component="legend" sx={{ color: "#fff", fontSize: "0.9rem" }}>
                 Abwehrlinie
               </FormLabel>
@@ -490,7 +561,7 @@ export default function Taktikboard() {
               </RadioGroup>
             </FormControl>
 
-            <FormControl component="fieldset" sx={{ mt: 2 }}>
+            <FormControl component="fieldset" sx={{ mb: 1.5 }}>
               <FormLabel component="legend" sx={{ color: "#fff", fontSize: "0.9rem" }}>
                 Pass-Stil
               </FormLabel>
@@ -510,6 +581,67 @@ export default function Taktikboard() {
                   control={<Radio size="small" sx={{ color: "#888", "&.Mui-checked": { color: "#ffc447" } }} />}
                   label="Riskant"
                 />
+              </RadioGroup>
+            </FormControl>
+
+            {/* Neu: Pressing */}
+            <FormControl component="fieldset" sx={{ mb: 1.5 }}>
+              <FormLabel component="legend" sx={{ color: "#fff", fontSize: "0.9rem" }}>
+                Pressing
+              </FormLabel>
+              <RadioGroup row value={pressing} onChange={(e) => setPressing(e.target.value)}>
+                <FormControlLabel value="tief" label="Tief" control={<Radio size="small" sx={{ color: "#888", "&.Mui-checked": { color: "#ffc447" } }} />} />
+                <FormControlLabel value="mittel" label="Mittel" control={<Radio size="small" sx={{ color: "#888", "&.Mui-checked": { color: "#ffc447" } }} />} />
+                <FormControlLabel value="hoch" label="Hoch" control={<Radio size="small" sx={{ color: "#888", "&.Mui-checked": { color: "#ffc447" } }} />} />
+              </RadioGroup>
+            </FormControl>
+
+            {/* Neu: Tempo (Slider 0–100) */}
+            <Box sx={{ mb: 2 }}>
+              <FormLabel component="legend" sx={{ color: "#fff", fontSize: "0.9rem" }}>
+                Tempo ({tempo})
+              </FormLabel>
+              <Slider
+                value={tempo}
+                min={0}
+                max={100}
+                step={5}
+                onChange={(_, v) => setTempo(Array.isArray(v) ? v[0] : v)}
+              />
+            </Box>
+
+            {/* Neu: Breite */}
+            <FormControl component="fieldset" sx={{ mb: 1.5 }}>
+              <FormLabel component="legend" sx={{ color: "#fff", fontSize: "0.9rem" }}>
+                Spielbreite
+              </FormLabel>
+              <RadioGroup row value={width} onChange={(e) => setWidth(e.target.value)}>
+                <FormControlLabel value="eng" label="Eng" control={<Radio size="small" sx={{ color: "#888", "&.Mui-checked": { color: "#ffc447" } }} />} />
+                <FormControlLabel value="normal" label="Normal" control={<Radio size="small" sx={{ color: "#888", "&.Mui-checked": { color: "#ffc447" } }} />} />
+                <FormControlLabel value="breit" label="Breit" control={<Radio size="small" sx={{ color: "#888", "&.Mui-checked": { color: "#ffc447" } }} />} />
+              </RadioGroup>
+            </FormControl>
+
+            {/* Neu: Gegenpressing */}
+            <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ mb: 1.5 }}>
+              <FormLabel component="legend" sx={{ color: "#fff", fontSize: "0.9rem" }}>
+                Gegenpressing
+              </FormLabel>
+              <Switch
+                checked={counterPress}
+                onChange={(e) => setCounterPress(e.target.checked)}
+              />
+            </Stack>
+
+            {/* Neu: Zeitspiel */}
+            <FormControl component="fieldset">
+              <FormLabel component="legend" sx={{ color: "#fff", fontSize: "0.9rem" }}>
+                Zeitspiel
+              </FormLabel>
+              <RadioGroup row value={timeWaste} onChange={(e) => setTimeWaste(e.target.value)}>
+                <FormControlLabel value="aus" label="Aus" control={<Radio size="small" sx={{ color: "#888", "&.Mui-checked": { color: "#ffc447" } }} />} />
+                <FormControlLabel value="leicht" label="Leicht" control={<Radio size="small" sx={{ color: "#888", "&.Mui-checked": { color: "#ffc447" } }} />} />
+                <FormControlLabel value="stark" label="Stark" control={<Radio size="small" sx={{ color: "#888", "&.Mui-checked": { color: "#ffc447" } }} />} />
               </RadioGroup>
             </FormControl>
 
@@ -756,60 +888,95 @@ export default function Taktikboard() {
           ) : (
             <Paper elevation={3}>
               <List>
-                {onPitchPlayers.map((player, index) => (
-                  <Box key={player.id} sx={{ px: 2, py: 1.5 }}>
-                    <Stack direction="row" alignItems="center" spacing={2} sx={{ mb: 1 }}>
-                      <Avatar src={player.avatarUrl || ""}>{player.nachname?.[0]}</Avatar>
-                      <Box sx={{ flex: 1 }}>
-                        <Typography sx={{ fontWeight: 700 }}>
-                          {player.vorname} {player.nachname}
-                        </Typography>
-                        <Typography variant="body2" sx={{ opacity: 0.8 }}>
-                          Position: {player.positionKey}
-                        </Typography>
-                      </Box>
-                      <Button variant="outlined" color="error" onClick={() => handleRemovePlayer(player.positionKey)}>
-                        Vom Feld nehmen
-                      </Button>
-                    </Stack>
+                {onPitchPlayers.map((player, index) => {
+                  const base = basePos(player.positionKey);
+                  const roleOpts = roleOptionsForBase(base);
+                  return (
+                    <Box key={player.id} sx={{ px: 2, py: 1.5 }}>
+                      <Stack direction="row" alignItems="center" spacing={2} sx={{ mb: 1 }}>
+                        <Avatar src={player.avatarUrl || ""}>{player.nachname?.[0]}</Avatar>
+                        <Box sx={{ flex: 1 }}>
+                          <Typography sx={{ fontWeight: 700 }}>
+                            {player.vorname} {player.nachname}
+                          </Typography>
+                          <Typography variant="body2" sx={{ opacity: 0.8 }}>
+                            Position: {player.positionKey}
+                          </Typography>
+                        </Box>
+                        <Button variant="outlined" color="error" onClick={() => handleRemovePlayer(player.positionKey)}>
+                          Vom Feld nehmen
+                        </Button>
+                      </Stack>
 
-                    <Stack direction="row" spacing={3} sx={{ flexWrap: "wrap" }}>
-                      <FormControl component="fieldset" size="small">
-                        <FormLabel component="legend">Schusshäufigkeit</FormLabel>
-                        <RadioGroup
-                          row
-                          value={player.instructions?.shootTendency || "normal"}
-                          onChange={(e) =>
-                            handleInstructionChange(player.id, "shootTendency", e.target.value)
-                          }
-                        >
-                          <FormControlLabel value="niedrig" control={<Radio size="small" />} label="Niedrig" />
-                          <FormControlLabel value="normal" control={<Radio size="small" />} label="Normal" />
-                          <FormControlLabel value="hoch" control={<Radio size="small" />} label="Hoch" />
-                        </RadioGroup>
-                      </FormControl>
+                      <Stack direction="row" spacing={3} sx={{ flexWrap: "wrap" }}>
+                        {/* Schusshäufigkeit (bestehend) */}
+                        <FormControl component="fieldset" size="small">
+                          <FormLabel component="legend">Schusshäufigkeit</FormLabel>
+                          <RadioGroup
+                            row
+                            value={player.instructions?.shootTendency || "normal"}
+                            onChange={(e) =>
+                              handleInstructionChange(player.id, "shootTendency", e.target.value)
+                            }
+                          >
+                            <FormControlLabel value="niedrig" control={<Radio size="small" />} label="Niedrig" />
+                            <FormControlLabel value="normal" control={<Radio size="small" />} label="Normal" />
+                            <FormControlLabel value="hoch" control={<Radio size="small" />} label="Hoch" />
+                          </RadioGroup>
+                        </FormControl>
 
-                      <FormControl component="fieldset" size="small">
-                        <FormLabel component="legend">Pass-Risiko</FormLabel>
-                        <RadioGroup
-                          row
-                          value={player.instructions?.passRisk || "normal"}
-                          onChange={(e) =>
-                            handleInstructionChange(player.id, "passRisk", e.target.value)
-                          }
-                        >
-                          <FormControlLabel value="sicher" control={<Radio size="small" />} label="Sicher" />
-                          <FormControlLabel value="normal" control={<Radio size="small" />} label="Normal" />
-                          <FormControlLabel value="riskant" control={<Radio size="small" />} label="Riskant" />
-                        </RadioGroup>
-                      </FormControl>
-                    </Stack>
+                        {/* Pass-Risiko (bestehend) */}
+                        <FormControl component="fieldset" size="small">
+                          <FormLabel component="legend">Pass-Risiko</FormLabel>
+                          <RadioGroup
+                            row
+                            value={player.instructions?.passRisk || "normal"}
+                            onChange={(e) =>
+                              handleInstructionChange(player.id, "passRisk", e.target.value)
+                            }
+                          >
+                            <FormControlLabel value="sicher" control={<Radio size="small" />} label="Sicher" />
+                            <FormControlLabel value="normal" control={<Radio size="small" />} label="Normal" />
+                            <FormControlLabel value="riskant" control={<Radio size="small" />} label="Riskant" />
+                          </RadioGroup>
+                        </FormControl>
 
-                    {index < onPitchPlayers.length - 1 && (
-                      <Divider sx={{ mt: 2 }} />
-                    )}
-                  </Box>
-                ))}
+                        {/* Neu: Dribbling-Tendenz */}
+                        <FormControl component="fieldset" size="small">
+                          <FormLabel component="legend">Dribbling-Tendenz</FormLabel>
+                          <RadioGroup
+                            row
+                            value={player.instructions?.dribbleTendency || "normal"}
+                            onChange={(e) =>
+                              handleInstructionChange(player.id, "dribbleTendency", e.target.value)
+                            }
+                          >
+                            <FormControlLabel value="niedrig" control={<Radio size="small" />} label="Niedrig" />
+                            <FormControlLabel value="normal" control={<Radio size="small" />} label="Normal" />
+                            <FormControlLabel value="hoch" control={<Radio size="small" />} label="Hoch" />
+                          </RadioGroup>
+                        </FormControl>
+
+                        {/* Neu: Rolle (positionsabhängig) */}
+                        <FormControl size="small" sx={{ minWidth: 220 }}>
+                          <FormLabel component="legend">Rolle</FormLabel>
+                          <Select
+                            value={player.instructions?.role || "auto"}
+                            onChange={(e) => handleInstructionChange(player.id, "role", e.target.value)}
+                          >
+                            {roleOpts.map((r) => (
+                              <MenuItem key={r.v} value={r.v}>{r.l}</MenuItem>
+                            ))}
+                          </Select>
+                        </FormControl>
+                      </Stack>
+
+                      {index < onPitchPlayers.length - 1 && (
+                        <Divider sx={{ mt: 2 }} />
+                      )}
+                    </Box>
+                  );
+                })}
               </List>
             </Paper>
           )}
@@ -853,7 +1020,9 @@ export default function Taktikboard() {
                           <>
                             <Typography sx={{ fontWeight: 700 }}>{tpl.name}</Typography>
                             <Typography variant="body2" sx={{ opacity: 0.7 }}>
-                              {tpl.formationKey} · Abwehrlinie: {tpl.defensiveLine || "normal"} · Pass-Stil: {tpl.passStyle || "gemischt"}
+                              {tpl.formationKey} · Abwehrlinie: {tpl.defensiveLine || "normal"} · Pass-Stil: {tpl.passStyle || "gemischt"} ·
+                              Pressing: {tpl.pressing || "mittel"} · Tempo: {typeof tpl.tempo === "number" ? tpl.tempo : 50} · Breite: {tpl.width || "normal"} ·
+                              Gegenpressing: {typeof tpl.counterPress === "boolean" ? (tpl.counterPress ? "an" : "aus") : "an"} · Zeitspiel: {tpl.timeWaste || "aus"}
                             </Typography>
                           </>
                         )}

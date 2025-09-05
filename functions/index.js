@@ -1,6 +1,4 @@
-// functions/index.js
-// Nutzt firebase-functions v2 (ESM-Stil) + firebase-admin
-
+// ESM + firebase-functions v2
 import { onDocumentUpdated } from "firebase-functions/v2/firestore";
 import { onCall, HttpsError } from "firebase-functions/v2/https";
 import { onSchedule } from "firebase-functions/v2/scheduler";
@@ -13,25 +11,17 @@ export { createSeason };
 // Simulations-Engine
 import { runSimulation } from "./simulation/engine.js";
 
-// --- INIT ---
 admin.initializeApp();
 const db = admin.firestore();
 const auth = admin.auth();
 setGlobalOptions({ region: "europe-west3" });
 
-// Optional: Ignoriere undefined global (wir bereinigen trotzdem proaktiv).
-try {
-  db.settings({ ignoreUndefinedProperties: true });
-} catch { /* older SDKs may not support, safe to ignore */ }
-
-// ---------------------------------------------------------
-// Helper: Zahl normalisieren
+// ---- Helper ----
 const toNumber = (x) => {
   const n = Number(x);
   return Number.isFinite(n) ? n : 0;
 };
 
-// Helper: Budget/Balance per increment anpassen
 async function incrementTeamBalance(teamId, delta) {
   const ref = db.collection("teams").doc(teamId);
   await ref.set(
@@ -43,7 +33,6 @@ async function incrementTeamBalance(teamId, delta) {
   );
 }
 
-// Helper: Transaktion anlegen
 async function addTransaction(teamId, tx) {
   const ref = db.collection("teams").doc(teamId).collection("transactions").doc();
   await ref.set({
@@ -55,120 +44,48 @@ async function addTransaction(teamId, tx) {
   return ref.id;
 }
 
-// ---------------------------------------------------------
-// Firestore-Sanitizer (rekursiv)
-function sanitizeForFirestore(value) {
-  if (value === undefined) return undefined; // Aufrufender Code soll Feld entfernen, nicht als null schreiben
-  if (value === null) return null;
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) return null;
-    return value;
-  }
-  if (typeof value === "string") {
-    // defensiv: Strings nicht explodieren lassen
-    return value.length > 20000 ? value.slice(0, 20000) : value;
-  }
-  if (Array.isArray(value)) {
-    const arr = value
-      .map((v) => sanitizeForFirestore(v))
-      .filter((v) => v !== undefined);
-    return arr;
-  }
-  if (value instanceof Date) return value;
-  if (typeof value === "object") {
-    const out = {};
-    for (const [k, v] of Object.entries(value)) {
-      const sv = sanitizeForFirestore(v);
-      if (sv !== undefined) out[k] = sv;
-    }
-    return out;
-  }
-  return value;
-}
+// ---- Persistenz: Disziplin & Verletzungen (nur Pflichtspiele) ----
+async function applyPostMatchEffects(gameDoc, finalState, gameAfter) {
+  const isFS = (gameAfter?.competitionCategory || '').toUpperCase() === 'FS';
+  if (isFS) return; // in Freundschaftsspielen nichts persistieren
 
-// Sim-Log normalisieren: minute nie undefined, Felder bereinigen
-function normalizeSimulationLog(log) {
-  if (!Array.isArray(log)) return [];
-  return log.map((entry, idx) => {
-    const safeMinuteRaw =
-      entry?.minute === undefined || entry?.minute === null
-        ? 0
-        : Number(entry.minute);
-    const safeMinute = Number.isFinite(safeMinuteRaw) ? safeMinuteRaw : 0;
+  const batch = db.batch();
 
-    // bekannte Felder beibehalten, Rest in payload/meta
-    const { type, message, teamId, playerId, opponentId, zone, meta, payload, ...rest } = entry || {};
-    const packed = {
-      minute: safeMinute,
-      type: type || rest?.type || "INFO",
-      message: message ?? null,
-      teamId: teamId ?? null,
-      playerId: playerId ?? null,
-      opponentId: opponentId ?? null,
-      zone: zone ?? null,
-      meta: sanitizeForFirestore(meta ?? {}),
-      payload: sanitizeForFirestore({ ...rest, ...(payload ?? {}) }),
-      // kleiner Marker zur leichteren Fehlersuche:
-      _i: idx,
-    };
-    return sanitizeForFirestore(packed);
+  // 1) Gelbe increment
+  const yellowInc = finalState.postMatch?.yellowIncrements || {};
+  Object.entries(yellowInc).forEach(([playerId, inc]) => {
+    const pRef = db.collection('players').doc(playerId);
+    batch.set(pRef, { discipline: { yellows: admin.firestore.FieldValue.increment(inc) } }, { merge: true });
   });
-}
 
-// Ratings: numerisch, keine undefined
-function normalizePlayerRatings(ratings) {
-  const out = {};
-  if (ratings && typeof ratings === "object") {
-    for (const [pid, val] of Object.entries(ratings)) {
-      out[pid] = toNumber(val);
-    }
-  }
-  return out;
-}
+  // 2) Sperren (aus Rot/2xGelb)
+  const susp = Array.isArray(finalState.postMatch?.suspensions) ? finalState.postMatch.suspensions : [];
+  susp.forEach(s => {
+    if (!s?.playerId || !s?.matches) return;
+    const pRef = db.collection('players').doc(s.playerId);
+    // Competition-spezifische Sperre
+    const key = `discipline.suspensions.${gameAfter.competitionCode || 'GEN'}`;
+    batch.set(pRef, { [key]: admin.firestore.FieldValue.increment(s.matches) }, { merge: true });
+  });
 
-// Stats: fehlende Zähler -> 0, alles bereinigen
-function normalizePlayerStats(stats) {
-  const out = {};
-  if (!stats || typeof stats !== "object") return out;
-  for (const [pid, s] of Object.entries(stats)) {
-    const ss = { ...(s || {}) };
-    // typische Zähler defensiv auf Zahl casten
-    const counters = [
-      "passes", "passesCompleted",
-      "dribbles", "dribblesSucceeded",
-      "shots", "shotsOnTarget", "goals", "assists",
-      "crosses", "crossesCompleted",
-      "throughBalls", "throughBallsCompleted",
-      "tackles", "tacklesSucceeded",
-      "interceptions", "saves",
-      "foulsCommitted", "foulsDrawn",
-      "yellowCards", "cardsYellow", "redCard", "cardsRed",
-    ];
-    for (const k of counters) {
-      ss[k] = toNumber(ss[k] ?? 0);
-    }
-    out[pid] = sanitizeForFirestore(ss);
-  }
-  return out;
-}
+  // 3) Verletzungen
+  const injuries = Array.isArray(finalState.postMatch?.injuries) ? finalState.postMatch.injuries : [];
+  injuries.forEach(i => {
+    if (!i?.playerId || !i?.matches) return;
+    const pRef = db.collection('players').doc(i.playerId);
+    batch.set(pRef, {
+      injury: {
+        matchesRemaining: i.matches,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }
+    }, { merge: true });
+  });
 
-// Lineup-Array absichern
-function normalizeLineup(arr) {
-  if (!Array.isArray(arr)) return [];
-  return arr
-    .map((x) =>
-      sanitizeForFirestore({
-        positionKey: x?.positionKey || x?.position || null,
-        position: x?.position || null,
-        playerId: x?.playerId || null,
-        instructions: x?.instructions || {},
-      })
-    )
-    .filter((x) => x && x.playerId);
+  await batch.commit();
 }
 
 // ========================================================================================
-// 1) SPIEL-SIMULATION (status: scheduled -> live  löst Simulation aus)
+// 1) SPIEL-SIMULATION (scheduled -> live)
 // ========================================================================================
 export const startSimulation = onDocumentUpdated("games/{gameId}", async (event) => {
   const before = event.data.before.data();
@@ -176,8 +93,6 @@ export const startSimulation = onDocumentUpdated("games/{gameId}", async (event)
   const gameId = event.params.gameId;
 
   if (!before || !after) return null;
-
-  // Nur starten, wenn explizit von "scheduled" -> "live" gewechselt wurde
   if (!(before.status === "scheduled" && after.status === "live")) {
     logger.info(`Kein Start für Spiel ${gameId}, Statusänderung nicht relevant.`);
     return null;
@@ -187,71 +102,62 @@ export const startSimulation = onDocumentUpdated("games/{gameId}", async (event)
   const gameRef = db.collection("games").doc(gameId);
 
   try {
-    const homeTeamDoc = await db.collection("teams").doc(after.teamHomeId).get();
-    const awayTeamDoc = await db.collection("teams").doc(after.teamAwayId).get();
-    if (!homeTeamDoc.exists || !awayTeamDoc.exists) {
-      throw new Error("Ein oder beide Teams wurden nicht gefunden.");
-    }
+    const [homeTeamDoc, awayTeamDoc] = await Promise.all([
+      db.collection("teams").doc(after.teamHomeId).get(),
+      db.collection("teams").doc(after.teamAwayId).get(),
+    ]);
+    if (!homeTeamDoc.exists || !awayTeamDoc.exists) throw new Error("Ein oder beide Teams wurden nicht gefunden.");
 
     const homeTeam = { id: homeTeamDoc.id, ...homeTeamDoc.data() };
     const awayTeam = { id: awayTeamDoc.id, ...awayTeamDoc.data() };
 
-    const homeLineup = normalizeLineup(homeTeam.defaultFormation || []);
-    const awayLineup = normalizeLineup(awayTeam.defaultFormation || []);
-    if (homeLineup.length < 11 || awayLineup.length < 11) {
-      throw new Error("Aufstellungen unvollständig.");
-    }
+    const homeLineup = homeTeam.defaultFormation || [];
+    const awayLineup = awayTeam.defaultFormation || [];
+    if (homeLineup.length < 11 || awayLineup.length < 11) throw new Error("Aufstellungen unvollständig.");
 
-    const allPlayerIds = [
-      ...homeLineup.map((p) => p.playerId),
-      ...awayLineup.map((p) => p.playerId),
-    ];
-    const playerDocs = await Promise.all(
-      allPlayerIds.map((id) => db.collection("players").doc(id).get())
-    );
-    const players = playerDocs.map((snap) => ({ id: snap.id, ...snap.data() }));
+    const allPlayerIds = [...homeLineup.map(p => p.playerId), ...awayLineup.map(p => p.playerId)];
+    const playerDocs = await Promise.all(allPlayerIds.map(id => db.collection("players").doc(id).get()));
+    const players = playerDocs.map(snap => ({ id: snap.id, ...snap.data() }));
 
     logger.info(`Spieler geladen (${players.length}). Starte Engine...`);
-    const finalGameState = runSimulation(
-      homeTeam,
-      awayTeam,
-      players,
-      homeLineup,
-      awayLineup
-    );
 
-    // --- Persistente Daten sicher normalisieren ---
-    const safeLog = normalizeSimulationLog(finalGameState?.log || []);
-    const safeRatings = normalizePlayerRatings(finalGameState?.playerRatings || {});
-    const safeStats = normalizePlayerStats(finalGameState?.playerStats || {});
-    const safeHomeLineup = normalizeLineup(homeLineup);
-    const safeAwayLineup = normalizeLineup(awayLineup);
+    const options = {
+      competitionCategory: after.competitionCategory || 'FS',
+      competitionCode: after.competitionCode || null,
+    };
+    const finalGameState = runSimulation(homeTeam, awayTeam, players, homeLineup, awayLineup, options);
 
-    const payload = sanitizeForFirestore({
+    // Logs: keine undefined
+    const safeLog = (finalGameState.log || []).map(e => ({
+      minute: Number.isFinite(e.minute) ? e.minute : 0,
+      type: String(e.type || 'INFO'),
+      data: e.data || {},
+    }));
+
+    await gameRef.update({
       status: "finished",
-      homeScore: toNumber(finalGameState?.homeScore),
-      awayScore: toNumber(finalGameState?.awayScore),
+      homeScore: finalGameState.homeScore,
+      awayScore: finalGameState.awayScore,
       simulationLog: safeLog,
-      playerRatings: safeRatings,
-      playerStats: safeStats,
+      playerRatings: finalGameState.playerRatings || {},
+      playerStats: finalGameState.playerStats || {},
       homeFormationKey: homeTeam.formationKey || "Unbekannt",
       awayFormationKey: awayTeam.formationKey || "Unbekannt",
-      lineupHome: safeHomeLineup,
-      lineupAway: safeAwayLineup,
+      lineupHome: homeLineup,
+      lineupAway: awayLineup,
       finishedAt: admin.firestore.FieldValue.serverTimestamp(),
       simulationMode: "batch",
     });
 
-    await gameRef.update(payload);
+    // Persistente Effekte anwenden (nur Pflichtspiel)
+    await applyPostMatchEffects(gameRef, finalGameState, after);
 
     logger.info(`✅ Ergebnis für Spiel ${gameId} gespeichert.`);
   } catch (error) {
-    logger.error(`❌ Fehler in Simulation für ${gameId}:`, error);
+    logger.error(`Error: ❌ Fehler in Simulation für ${gameId}: ${error}`);
     await gameRef.update({
       status: "error",
-      simulationLog: admin.firestore.FieldValue.arrayUnion(
-        `Simulationsfehler: ${error.message}`
-      ),
+      simulationLog: admin.firestore.FieldValue.arrayUnion(`Simulationsfehler: ${error.message}`),
     });
   }
   return null;
@@ -292,26 +198,17 @@ export const acceptGameInvite = onCall(async (request) => {
 });
 
 // ========================================================================================
-// 3) GEPLANTE SPIELE AUTOMATISCH STARTEN (setzt scheduled -> live)
+// 3) GEPLANTE SPIELE AUTOMATISCH STARTEN
 // ========================================================================================
 export const checkScheduledGames = onSchedule("every 1 minutes", async () => {
-  logger.info("Suche nach zu startenden Spielen…");
   const now = new Date();
-  const q = db
-    .collection("games")
-    .where("status", "==", "scheduled")
-    .where("scheduledStartTime", "<=", now);
-
+  const q = db.collection("games").where("status", "==", "scheduled").where("scheduledStartTime", "<=", now);
   const snap = await q.get();
-  if (snap.empty) {
-    logger.info("Keine Spiele zum Starten gefunden.");
-    return null;
-  }
+  if (snap.empty) return null;
 
   const batch = db.batch();
   snap.docs.forEach((doc) => batch.update(doc.ref, { status: "live" }));
   await batch.commit();
-  logger.info(`${snap.size} Spiel(e) auf 'live' gesetzt.`);
   return null;
 });
 
@@ -320,17 +217,13 @@ export const checkScheduledGames = onSchedule("every 1 minutes", async () => {
 // ========================================================================================
 export const cleanupOldInvites = onSchedule("every 1 hours", async () => {
   const cutoff = new Date(Date.now() - 12 * 60 * 60 * 1000);
-  const q = db
-    .collection("game_invites")
-    .where("status", "==", "pending")
-    .where("createdAt", "<=", cutoff);
+  const q = db.collection("game_invites").where("status", "==", "pending").where("createdAt", "<=", cutoff);
   const snap = await q.get();
   if (snap.empty) return null;
 
   const batch = db.batch();
   snap.docs.forEach((doc) => batch.delete(doc.ref));
   await batch.commit();
-  logger.info(`${snap.size} alte Einladung(en) gelöscht.`);
   return null;
 });
 
@@ -341,10 +234,8 @@ export const addAdminRole = onCall(async (request) => {
   try {
     const userRec = await auth.getUserByEmail(request.data.email);
     await auth.setCustomUserClaims(userRec.uid, { admin: true });
-    logger.info(`User ${request.data.email} ist jetzt Admin.`);
     return { message: `Erfolg! ${request.data.email} ist jetzt Admin.` };
   } catch (err) {
-    logger.error("Fehler beim Hinzufügen der Admin-Rolle:", err);
     throw new HttpsError("internal", err.message);
   }
 });
@@ -362,24 +253,18 @@ export const executeTransfer = onCall(async (request) => {
 
   const t = snap.data();
   if (t.status !== "acceptedByUser") {
-    throw new HttpsError(
-      "failed-precondition",
-      `Transfer im falschen Status (${t.status}).`
-    );
+    throw new HttpsError("failed-precondition", `Transfer im falschen Status (${t.status}).`);
   }
 
   const myPlayers = Array.isArray(t.myPlayers) ? t.myPlayers : [];
   const oppPlayers = Array.isArray(t.oppPlayers) ? t.oppPlayers : [];
-
-  // Netto-Geldfluss: myAmount (vom fromTeam) minus oppAmount (vom toTeam)
   const myAmount = toNumber(t.myAmount);
   const oppAmount = toNumber(t.oppAmount);
-  const net = myAmount - oppAmount; // >0: fromTeam zahlt toTeam; <0: toTeam zahlt fromTeam
+  const net = myAmount - oppAmount;
 
-  const fromTeamId = t.fromTeamId; // der Anbieter (dein UI schreibt das so)
+  const fromTeamId = t.fromTeamId;
   const toTeamId = t.toTeamId;
 
-  // Teamnamen für Transaktionsbeschreibung nachladen (best effort)
   const [fromTeamSnap, toTeamSnap] = await Promise.all([
     db.collection("teams").doc(fromTeamId).get(),
     db.collection("teams").doc(toTeamId).get(),
@@ -390,15 +275,9 @@ export const executeTransfer = onCall(async (request) => {
   try {
     const batch = db.batch();
 
-    // Spieler tauschen
-    myPlayers.forEach((pid) =>
-      batch.update(db.collection("players").doc(pid), { teamId: toTeamId })
-    );
-    oppPlayers.forEach((pid) =>
-      batch.update(db.collection("players").doc(pid), { teamId: fromTeamId })
-    );
+    myPlayers.forEach((pid) => batch.update(db.collection("players").doc(pid), { teamId: toTeamId }));
+    oppPlayers.forEach((pid) => batch.update(db.collection("players").doc(pid), { teamId: fromTeamId }));
 
-    // Transferstatus abschließen
     batch.update(transferRef, {
       status: "completed",
       executedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -406,23 +285,18 @@ export const executeTransfer = onCall(async (request) => {
 
     await batch.commit();
 
-    // Finanzbuchungen (außer wenn net = 0, dann nur History)
     if (net !== 0) {
-      // fromTeam verliert "net" (wenn net>0) bzw. gewinnt (wenn net<0)
       await Promise.all([
         incrementTeamBalance(fromTeamId, -net),
         incrementTeamBalance(toTeamId, net),
       ]);
 
-      // Transaktionseinträge
-      const descFrom =
-        net > 0
-          ? `Ablöse an ${toTeamName} (Transfer ${transferId})`
-          : `Ablöse von ${toTeamName} erhalten (Transfer ${transferId})`;
-      const descTo =
-        net > 0
-          ? `Ablöse von ${fromTeamName} erhalten (Transfer ${transferId})`
-          : `Ablöse an ${fromTeamName} (Transfer ${transferId})`;
+      const descFrom = net > 0
+        ? `Ablöse an ${toTeamName} (Transfer ${transferId})`
+        : `Ablöse von ${toTeamName} erhalten (Transfer ${transferId})`;
+      const descTo = net > 0
+        ? `Ablöse von ${fromTeamName} erhalten (Transfer ${transferId})`
+        : `Ablöse an ${fromTeamName} (Transfer ${transferId})`;
 
       await Promise.all([
         addTransaction(fromTeamId, {
@@ -444,7 +318,6 @@ export const executeTransfer = onCall(async (request) => {
       ]);
     }
 
-    // Transfer-Historie (Top-Level)
     await db.collection("transfer_history").add({
       transferId,
       fromTeamId,
@@ -455,15 +328,13 @@ export const executeTransfer = onCall(async (request) => {
       oppPlayers,
       myAmount,
       oppAmount,
-      netFlowFromFromTeamToToTeam: net, // >0: Geld floss von from->to
+      netFlowFromFromTeamToToTeam: net,
       completedAt: admin.firestore.FieldValue.serverTimestamp(),
       createdFromTransferAt: t.createdAt || null,
     });
 
-    logger.info(`✅ Transfer ${transferId} abgeschlossen und verbucht.`);
     return { success: true, net };
   } catch (err) {
-    logger.error(`Fehler bei executeTransfer ${transferId}:`, err);
     throw new HttpsError("internal", "Fehler beim Ausführen des Transfers.");
   }
 });
